@@ -60,8 +60,9 @@ typed. In a committed file nothing is rewritten, because teammates without outfi
 read the raw text: `ON`, `OFF` (any case other than exactly `on`/`off`), `false`,
 `no`, `0`, `true`, `yes`, `1` and a bare key get a warning telling you to write `on` or `off`.
 
-Until the hook dispatcher ships (the next release), a toggle only affects hooks
-that call `outfit get` themselves (see the snippet at the end).
+After `outfit init` (see [hooks.md](hooks.md)) `hook.<name> = off` skips that hook
+for you without any change to the team's hooks. Other toggles (`biome`, `tests`…)
+only affect hooks that ask for them with `outfit get` (see the snippet at the end).
 
 ## Where a value comes from
 
@@ -94,15 +95,16 @@ A profile name that no longer exists is treated as `base`, with a warning.
 | Command | What it does |
 |---|---|
 | `outfit get <key>` | prints the value. Unset: prints nothing and exits **1** (like `git config --get`). One git process, no writes. |
-| `outfit set <key>=<val>… [--here\|--global]` | personal override in git config; `key=` unsets (in that scope only: it prints which scopes still set the key). `--global` works outside a repo. `--here` needs `extensions.worktreeConfig` (`outfit init` will enable it; until then run `git config extensions.worktreeConfig true`). Note that git copies a worktree's `config.worktree` into every worktree created afterwards, so `--here` in the main worktree leaks into new ones until outfit strips the copies on `worktree add`. |
+| `outfit set <key>=<val>… [--here\|--global]` | personal override in git config; `key=` unsets (in that scope only: it prints which scopes still set the key). `--global` works outside a repo. `--here` needs `extensions.worktreeConfig`, which `outfit init` enables. Note that git copies a worktree's `config.worktree` into every worktree created afterwards, so `--here` in the main worktree leaks into new ones until outfit strips the copies on `worktree add`. |
 | `outfit ls` | profiles across the three tiers (`committed`, `local`, `worktree`), their keys and files; `*` marks the active one. |
-| `outfit status` | the active profile, where every toggle comes from, the files it swaps, and warnings. Enforces git ≥ 2.36. |
+| `outfit init` / `outfit uninstall` | install or remove the hook dispatcher: [hooks.md](hooks.md). |
+| `outfit status` | the active profile, where every toggle comes from, the files it swaps, the hook dispatcher's health (exit 4 when broken) and warnings. Enforces git ≥ 2.36. |
 
 All of them accept `--json`. Failures carry `"retryable"` and, when there is one, the exact `"fix"` command. `ls` shows a built-in `base` row (tier `builtin`): the profile that means no swaps.
 
 Exit codes: `0` ok, `1` error (or an unset `get`: there is no registry of known
 keys, so an unset key is "not found", like `git config --get`, never "unknown"),
-`2` usage or unknown profile, `3` needs a human and `4` out of sync or stale (`status` only): the last two are reserved and not emitted yet.
+`2` usage or unknown profile, `3` needs a human (reserved: not emitted yet) and `4` out of sync (`status` only: the hook dispatcher no longer points at its shims).
 
 ## Profile tiers
 
@@ -134,4 +136,7 @@ Decisions made while building, kept here so the reason outlives the PR:
 | §3.1 example `hook.pre-commit = off` in `[outfit]` | accepted, with a warning | git rejects that line and so does every teammate's `git config -f`; the subsection form is valid for both. |
 | §4 exit 2 = "unknown profile/key" | `get` of an unset key exits **1** | there is no registry of keys; it mirrors `git config --get`, which the §3.0 fallback chains with `||`. |
 | §2 `version` floor check | `version` warns and exits 0 on old git | `install.sh` prints it last; it must not fail after a good install. |
+| §3.6 shim only what exists | a shim for **every** client hook, resolved at run time | a hook added after `init` (a new secret scan, husky created by a later `npm install`) would otherwise be skipped silently. |
+| §3.6 `<git-dir>/config.worktree` via `git config --worktree` | the same files, written with `git config --file` | works for worktrees whose checkout is missing. |
+| §4 uninstall removes `outfit.*` | removes only what was added after `init` | settings from before `init` are the user's; `git config --list` still comes back identical. |
 | (unspecified) | a committed profile wins a name clash, even on the hot path (`get`) | per spec §3.1; `status` and `ls` warn. |

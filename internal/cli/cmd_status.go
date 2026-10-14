@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
+	"github.com/prosperity-solutions/outfit/internal/hooks"
 	"github.com/prosperity-solutions/outfit/internal/profiles"
+	"github.com/prosperity-solutions/outfit/internal/state"
 )
 
 type statusFile struct {
@@ -19,14 +22,22 @@ type statusFile struct {
 	Tier    string `json:"tier"`
 }
 
+type dispatcherInfo struct {
+	Installed bool   `json:"installed"`
+	OK        bool   `json:"ok"`
+	Problem   string `json:"problem,omitempty"`
+}
+
 type statusJSON struct {
 	Profile config.ProfileChoice `json:"profile"`
 	// Tier is the active profile's tier ("" for base or a missing profile).
-	Tier     string           `json:"tier"`
-	Toggles  []config.Toggle  `json:"toggles"`
-	Locked   []string         `json:"locked"`
-	Files    []statusFile     `json:"files"`
-	Warnings []config.Warning `json:"warnings"`
+	Tier    string          `json:"tier"`
+	Toggles []config.Toggle `json:"toggles"`
+	// Dispatcher is the state of the hook dispatcher.
+	Dispatcher dispatcherInfo   `json:"dispatcher"`
+	Locked     []string         `json:"locked"`
+	Files      []statusFile     `json:"files"`
+	Warnings   []config.Warning `json:"warnings"`
 }
 
 // cmdStatus shows the active profile and where every value comes from. It is
@@ -74,13 +85,23 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 			st.Files = append(st.Files, statusFile{Path: f, Profile: l.Profile.Name, Tier: st.Tier})
 		}
 	}
+	st.Dispatcher = dispatcherHealth(ctx, l, e.Getenv("HOME"))
+	var outOfSync bool
+	if st.Dispatcher.Installed && !st.Dispatcher.OK {
+		outOfSync = true
+		st.Warnings = append(st.Warnings, config.Warning{Source: "hook dispatcher", Message: st.Dispatcher.Problem + ": your team's hooks are NOT running. Fix: outfit init"})
+	}
 	// A clash between a personal and a committed profile name is worth saying.
 	st.Warnings = append(st.Warnings, profiles.List(ctx, l.Git, l.Repo).Warnings...)
 
+	exit := ExitOK
+	if outOfSync {
+		exit = ExitOutOfSync
+	}
 	if *asJSON {
 		out, _ := json.Marshal(st)
 		fmt.Fprintln(e.Stdout, string(out))
-		return ExitOK
+		return exit
 	}
 
 	w := e.Stdout
@@ -134,10 +155,73 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 		}
 		fmt.Fprintf(w, "%s%s ← %s (%s)\n", label, f.Path, f.Profile, f.Tier)
 	}
+	if st.Dispatcher.Installed {
+		if st.Dispatcher.OK {
+			fmt.Fprintln(w, "hooks    dispatcher installed")
+		} else {
+			fmt.Fprintf(w, "hooks    dispatcher BROKEN: %s\n", st.Dispatcher.Problem)
+		}
+	}
 	for _, wn := range st.Warnings {
 		fmt.Fprintf(e.Stderr, "warning: %s\n", wn)
 	}
-	return ExitOK
+	return exit
+}
+
+// dispatcherHealth checks that, if init ran, this worktree still points at
+// outfit's shims and they are all intact. A moved repository or a deleted
+// .git/outfit leaves a dangling core.hooksPath, which makes git skip EVERY hook
+// without a word; a tool that renamed our pre-commit shim bypasses the guard.
+func dispatcherHealth(ctx context.Context, l *loaded, home string) dispatcherInfo {
+	ours := hooks.Dir(l.Repo.CommonDir)
+	var got string
+	for _, h := range l.Cfg.HooksPaths {
+		if h.Scope == config.ScopeWorktree {
+			got = h.Value
+		}
+	}
+	_, installErr := state.ReadInstall(l.Repo.CommonDir)
+	abs := ""
+	if got != "" {
+		abs = hooks.ExpandPath(got, l.Repo.WorkTree, home)
+	}
+	// Installed: init left its record, or the worktree still points at an outfit
+	// directory (possibly one that is gone: exactly what a lost record looks like).
+	if installErr != nil && (abs == "" || !hooks.IsOutfitDir(abs)) {
+		return dispatcherInfo{}
+	}
+	info := dispatcherInfo{Installed: true}
+	switch {
+	case got == "":
+		info.Problem = "core.hooksPath is not set for this worktree"
+	case !hooks.SameDir(abs, ours):
+		info.Problem = "core.hooksPath points at " + got + " (outfit's shims are in " + ours + "; was the repository moved?)"
+	case len(hooks.Generated(ours)) == 0:
+		info.Problem = "the shim directory " + ours + " is empty or missing"
+	default:
+		for _, n := range hooks.Triggers {
+			if !hooks.IsOurs(filepath.Join(ours, n)) {
+				info.Problem = "the " + n + " shim was replaced or removed (lefthook install does this)"
+				break
+			}
+		}
+		if info.Problem == "" {
+			if f := hooks.Foreign(ours); len(f) > 0 {
+				info.Problem = "another tool put hooks into outfit's directory: " + strings.Join(f, ", ")
+			}
+		}
+		if info.Problem == "" {
+			orig := hooks.OriginalDir(l.Cfg, ours, l.Repo.WorkTree, l.Repo.CommonDir, home)
+			for _, n := range hooks.ShimNames(orig) {
+				if !hooks.IsOurs(filepath.Join(ours, n)) {
+					info.Problem = "the team has a " + n + " hook with no shim"
+					break
+				}
+			}
+		}
+	}
+	info.OK = info.Problem == ""
+	return info
 }
 
 func nonNilStrings(s []string) []string {

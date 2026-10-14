@@ -8,6 +8,8 @@ import (
 
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
+	"github.com/prosperity-solutions/outfit/internal/hooks"
+	"github.com/prosperity-solutions/outfit/internal/state"
 )
 
 type setChange struct {
@@ -52,6 +54,17 @@ func cmdSet(ctx context.Context, e Env, args []string) int {
 		if err != nil {
 			return fail(Usagef("%v", err))
 		}
+		if name, isHook := strings.CutPrefix(nk, config.HookPrefix); isHook {
+			if !hooks.IsKnown(name) {
+				return fail(Usagef("%q is not a git hook name%s", name, didYouMean(name)).WithFix("outfit set hook.pre-commit=off"))
+			}
+			if v != "" && normalizeBool(v) != "on" && normalizeBool(v) != "off" {
+				return fail(Usagef("hook.%s must be on or off, not %q", name, v).WithFix("outfit set hook." + name + "=off"))
+			}
+		}
+		if hooks.IsKnown(nk) {
+			return fail(Usagef("%q is a git hook name, not a toggle: to skip that hook write hook.%s=off", nk, nk).WithFix("outfit set hook." + nk + "=off"))
+		}
 		if config.IsReserved(nk) {
 			fix := "git config --local outfit.profile <name>"
 			if nk == config.KeyLocked {
@@ -77,7 +90,7 @@ func cmdSet(ctx context.Context, e Env, args []string) int {
 	case *here:
 		scope, flagName = config.ScopeWorktree, "--worktree"
 		if !l.Cfg.WorktreeConfig {
-			return fail(Errorf("this repository has no per-worktree config yet (extensions.worktreeConfig is off)").WithFix("git config extensions.worktreeConfig true"))
+			return fail(Errorf("this repository has no per-worktree config yet (extensions.worktreeConfig is off)").WithFix("outfit init"))
 		}
 	}
 	for _, t := range todo {
@@ -112,6 +125,17 @@ func cmdSet(ctx context.Context, e Env, args []string) int {
 		changes = append(changes, ch)
 	}
 
+	hookNote := false
+	for _, c := range changes {
+		if strings.HasPrefix(c.Key, config.HookPrefix) && !c.Unset {
+			hookNote = true
+		}
+	}
+	if hookNote && l.Repo.CommonDir != "" {
+		if _, err := state.ReadInstall(l.Repo.CommonDir); err != nil {
+			fmt.Fprintln(e.Stderr, "note: this hook toggle only takes effect after `outfit init` (it installs the hook dispatcher)")
+		}
+	}
 	if *asJSON {
 		// An object, not a bare array, so fields can be added without breaking
 		// consumers.
@@ -167,4 +191,38 @@ func normalizeBool(v string) string {
 		return "off"
 	}
 	return v
+}
+
+// didYouMean suggests the closest git hook name to a typo.
+func didYouMean(name string) string {
+	best, bestD := "", 1<<30
+	for _, k := range hooks.Known {
+		if d := editDistance(name, k); d < bestD {
+			best, bestD = k, d
+		}
+	}
+	if bestD <= 3 {
+		return "; did you mean hook." + best + "?"
+	}
+	return ""
+}
+
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
 }
