@@ -13,7 +13,7 @@ import (
 
 // Repo describes where a repository lives on disk.
 type Repo struct {
-	// WorkTree is the top of the checkout ("" when discovered via GIT_DIR alone).
+	// WorkTree is the top of the checkout ("" only for a bare repository).
 	WorkTree string
 	// GitDir is this worktree's own git dir (<common>/worktrees/<n> for a linked
 	// worktree, the same as CommonDir otherwise).
@@ -35,16 +35,33 @@ func Discover(start string, getenv func(string) string) (Repo, error) {
 		if !filepath.IsAbs(gd) {
 			gd = filepath.Join(start, gd)
 		}
-		gd = filepath.Clean(gd)
+		gd = findGitDir(start, getenv("GIT_DIR"), gd)
 		common, err := commonDir(gd)
 		if err != nil {
 			return Repo{}, err
 		}
 		r := Repo{GitDir: gd, CommonDir: common}
-		if wt := getenv("GIT_WORK_TREE"); wt != "" {
+		switch wt := getenv("GIT_WORK_TREE"); {
+		case wt != "":
 			r.WorkTree = wt
-		} else if filepath.Base(gd) == ".git" {
+		case filepath.Base(gd) == ".git":
 			r.WorkTree = filepath.Dir(gd)
+		default:
+			// A linked worktree's git dir records where its checkout is.
+			if b, err := os.ReadFile(filepath.Join(gd, "gitdir")); err == nil {
+				if p := strings.TrimSpace(string(b)); p != "" {
+					if !filepath.IsAbs(p) { // worktree.useRelativePaths
+						p = filepath.Join(gd, p)
+					}
+					r.WorkTree = filepath.Dir(filepath.Clean(p))
+				}
+			}
+		}
+		if r.WorkTree == "" {
+			// Last resort (a separate git dir with no back-pointer): the nearest
+			// ancestor with a .git entry. Never the bare cwd: a hook that `cd`s into
+			// a package must not read that package's .outfit/.
+			r.WorkTree = enclosingWorkTree(start)
 		}
 		return r, nil
 	}
@@ -120,4 +137,35 @@ func commonDir(gitDir string) (string, error) {
 		c = filepath.Join(gitDir, c)
 	}
 	return filepath.Clean(c), nil
+}
+
+// findGitDir resolves a GIT_DIR value. A relative one is relative to the cwd git
+// had when it exported it, which a hook may since have left, so also try each
+// ancestor of start.
+func findGitDir(start, raw, joined string) string {
+	if filepath.IsAbs(raw) {
+		return filepath.Clean(raw)
+	}
+	for dir := start; ; dir = filepath.Dir(dir) {
+		cand := filepath.Join(dir, raw)
+		if _, err := os.Stat(filepath.Join(cand, "HEAD")); err == nil {
+			return filepath.Clean(cand)
+		}
+		if filepath.Dir(dir) == dir {
+			return filepath.Clean(joined)
+		}
+	}
+}
+
+// enclosingWorkTree walks up from start to the first directory holding a `.git`
+// entry. When there is none (a bare repo), it returns "".
+func enclosingWorkTree(start string) string {
+	for dir := start; ; dir = filepath.Dir(dir) {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		if filepath.Dir(dir) == dir {
+			return ""
+		}
+	}
 }
