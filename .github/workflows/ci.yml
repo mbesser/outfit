@@ -1,0 +1,174 @@
+name: CI
+
+# Draft PRs run nothing: every job below carries a draft guard, and
+# `ready_for_review` is in the trigger types so flipping a draft to ready fires
+# the run. `python3 tests/validate-workflow-gates.py` enforces this, and a
+# SKIPPED JOB LOOKS GREEN — read the ready run's jobs, never the rollup
+# (docs/ship.md Step 6.3).
+#
+# `all-green` is the one check the ruleset requires. Matrix jobs report expanded
+# names (`e2e (ubuntu-24.04, 2.36)`), so requiring `e2e` would never report.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  commits:
+    name: Conventional Commits
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Validate PR commits follow conventional format
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -e
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
+          FAILED=0
+          # The PR title becomes the squash commit, and svu reads it to cut the
+          # next version, so it must be a valid subject too.
+          if ! printf '%s' "$TITLE" | grep -qE "$PATTERN"; then
+            echo "❌ PR title: $TITLE"
+            FAILED=1
+          else
+            echo "✅ PR title: $TITLE"
+          fi
+          while IFS= read -r sha; do
+            MSG=$(git log --format='%s' -1 "$sha")
+            if ! printf '%s' "$MSG" | grep -qE "$PATTERN"; then
+              echo "❌ $sha: $MSG"
+              FAILED=1
+            else
+              echo "✅ $sha: $MSG"
+            fi
+          done < <(git rev-list "$BASE".."$HEAD")
+          if [ "$FAILED" -eq 1 ]; then
+            echo
+            echo "Expected: type(scope)?!?: description"
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            exit 1
+          fi
+
+  # Every PR must come through the ship workflow (docs/ship.md). It requires a
+  # `Ship-Stamp:` git trailer on the pull request's HEAD commit and re-derives the
+  # value with the helper taken from the PR's BASE commit, so a branch cannot
+  # neuter it and self-certify. Do not convert this job to `pull_request_target`:
+  # it executes a script from the checkout, which is harmless with a fork's
+  # read-only token and arbitrary code with the repository's own token otherwise.
+  ship:
+    name: Ship Workflow
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Selftest the gate
+        run: bash tests/validate-ship-stamp.sh --selftest
+      - name: Verify the PR came through the ship workflow
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          ACTOR: ${{ github.event.pull_request.user.login }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash tests/validate-ship-stamp.sh
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9
+        with:
+          version: latest
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - name: shellcheck
+        run: |
+          files=$(git ls-files 'install.sh' 'scripts/**/*.sh' | grep -E '(^install\.sh$|shim)' || true)
+          if [ -n "$files" ]; then printf '%s\n' "$files" | xargs shellcheck -s sh; fi
+          # The ported bash helpers are bash, not POSIX sh.
+          shellcheck -S warning -s bash scripts/dev/*.sh tests/*.sh
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Workflows do not run on draft PRs
+        run: |
+          pip install "pyyaml>=6,<7"
+          python3 tests/validate-workflow-gates.py --selftest
+          python3 tests/validate-workflow-gates.py
+      - name: goreleaser check
+        run: |
+          if [ -f .goreleaser.yaml ]; then
+            go run github.com/goreleaser/goreleaser/v2@v2.12.0 check
+          else
+            echo ".goreleaser.yaml not present yet; skipping"
+          fi
+
+  unit:
+    name: Unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+      - name: go test -race
+        run: go test -race ./...
+
+  # The single required check. Fails unless every needed job SUCCEEDED. The
+  # `commits` and `ship` jobs only exist on pull requests, so on a push to main
+  # they are expected to be skipped; nothing else may be.
+  all-green:
+    name: all-green
+    runs-on: ubuntu-24.04
+    needs: [commits, ship, lint, unit]
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && always()
+    steps:
+      - name: Every needed job must have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if [ "$EVENT" = "pull_request" ]; then
+            filter='[to_entries[] | select(.value.result != "success")] | length'
+          else
+            filter='[to_entries[] | select(.value.result != "success" and (.key != "commits" and .key != "ship" or .value.result != "skipped"))] | length'
+          fi
+          bad=$(echo "$NEEDS" | jq "$filter")
+          if [ "$bad" != "0" ]; then echo "❌ $bad job(s) did not succeed"; exit 1; fi
+          echo "✅ all needed jobs succeeded"

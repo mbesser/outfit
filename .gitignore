@@ -1,0 +1,6 @@
+/notes/
+.outfit-ship.json
+/dist/
+/outfit
+*.test
+.DS_Store
