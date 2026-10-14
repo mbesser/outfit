@@ -1,0 +1,505 @@
+name: Release
+
+# Runs on every push to main. Ported in structure from veld's release workflow
+# (MIT; see NOTICE). The whole story, and how to rotate the signing key, is in
+# docs/release.md.
+#
+#   version -> build -> smoke (4 native runners) -+
+#         \-> ci (waits for main's all-green) ----+-> publish -> verify (4 runners)
+#                                                           \-> verify-signing
+#
+# This is the ONLY workflow that references the MINISIGN_* and MACOS_* secrets,
+# and it only runs on pushes to main, so a pull request can never reach them.
+on:
+  push:
+    branches: [main]
+
+# Two quick merges must not compute the same tag, and a release must never be
+# cancelled half way.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# `shell: bash` adds -o pipefail, so a failing command on the left of a pipe fails
+# the step. (The unset default is `bash -e`, which ignores it.)
+defaults:
+  run:
+    shell: bash
+
+env:
+  REPO: prosperity-solutions/outfit
+
+jobs:
+  # ── 1. What version, if any ───────────────────────────────────────────────
+  version:
+    name: Next version
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      releasable: ${{ steps.v.outputs.releasable }}
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      previous: ${{ steps.v.outputs.previous }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      # No build cache in release jobs: it is shared with every job that runs on a
+      # push to main, and the build job holds the signing keys. Whatever wrote the
+      # cache first would decide what we compile and sign.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Compute the next version from Conventional Commits
+        id: v
+        run: |
+          go install github.com/caarlos0/svu/v3@v3.4.1
+          current=$(svu current)
+          next=$(svu next --v0)
+          # The latest PUBLISHED release: what installed clients are on, and what the
+          # update check in `verify` starts from. (Not the latest tag: a tag whose
+          # release never got published must not be treated as a release.)
+          # Only a 404 means "none": any other failure must stop the run, since an empty
+          # `previous` silently skips the key-rotation guard and the update check.
+          previous=""
+          if out=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>"$RUNNER_TEMP/err"); then
+            previous=$out
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/err"; then
+            cat "$RUNNER_TEMP/err"
+            echo "::error::could not read the latest release; not guessing"
+            exit 1
+          fi
+          echo "current=$current next=$next previous=${previous:-none}"
+          if [ "$next" = "$current" ]; then
+            # No new releasable commit. But if THIS commit already carries the
+            # tag and its release never got published (publish failed after
+            # the tag was pushed), this is a re-run that must finish the job,
+            # not a run with nothing to do.
+            published=unknown
+            if [ "$current" != v0.0.0 ] && [ "$(git rev-list -n1 "$current")" = "$GITHUB_SHA" ]; then
+              if gh api "repos/$REPO/releases/tags/$current" >/dev/null 2>"$RUNNER_TEMP/err"; then
+                published=yes
+              elif grep -q 'HTTP 404' "$RUNNER_TEMP/err"; then
+                published=no
+              else
+                cat "$RUNNER_TEMP/err"
+                echo "::error::could not tell whether $current is published; not guessing"
+                exit 1
+              fi
+            fi
+            if [ "$published" = no ]; then
+              echo "$current is tagged on this commit but not published: resuming it."
+            else
+              echo "Nothing releasable since $current (only docs/chore/ci commits). Stopping."
+              echo "releasable=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          {
+            echo "releasable=true"
+            echo "tag=$next"
+            echo "version=${next#v}"
+            echo "previous=$previous"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Releasing $next" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2. Build, sign, checksum ──────────────────────────────────────────────
+  build:
+    name: Build and sign
+    needs: version
+    if: needs.version.outputs.releasable == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
+      ALLOW_UNTRUSTED_PREVIOUS_KEYS: ${{ vars.ALLOW_UNTRUSTED_PREVIOUS_KEYS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      # No build cache in release jobs: it is shared with every job that runs on a
+      # push to main, and the build job holds the signing keys. Whatever wrote the
+      # cache first would decide what we compile and sign.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Fail early, naming the thing, rather than building for ten minutes and
+      # failing at the signing step.
+      - name: Check the signing configuration
+        env:
+          MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+          HAVE_MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
+          HAVE_MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD != '' }}
+          HAVE_P12: ${{ secrets.MACOS_SIGN_P12 != '' }}
+          HAVE_P12_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD != '' }}
+          HAVE_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY != '' }}
+          HAVE_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID != '' }}
+          HAVE_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID != '' }}
+        run: |
+          fail=0
+          if [ -z "$MINISIGN_PUBLIC_KEY" ]; then
+            echo "::error::the repository variable MINISIGN_PUBLIC_KEY is missing (Settings > Secrets and variables > Actions > Variables). Without it nothing can be signed or checked."
+            fail=1
+          else
+            var_key=$(printf '%s\n' "$MINISIGN_PUBLIC_KEY" | grep -vE '^(untrusted comment:|[[:space:]]*$)' | head -1 | tr -d '\r ')
+            if ! grep -qxF "$var_key" <(grep -vE '^(#|untrusted comment:|[[:space:]]*$)' internal/update/keys.txt | tr -d '\r '); then
+              echo "::error::MINISIGN_PUBLIC_KEY does not appear in internal/update/keys.txt. Clients would reject this release. Add the key there first (docs/release.md, 'Rotating the update key')."
+              fail=1
+            fi
+          fi
+          [ "$HAVE_MINISIGN_SECRET" = true ] || { echo "::error::the secret MINISIGN_SECRET_KEY is missing"; fail=1; }
+          [ "$HAVE_MINISIGN_PASSWORD" = true ] || { echo "::error::the secret MINISIGN_PASSWORD is missing"; fail=1; }
+          # macOS signing is optional, but half of it is a mistake.
+          if [ "$HAVE_P12" = true ]; then
+            [ "$HAVE_P12_PASSWORD" = true ] || { echo "::error::MACOS_SIGN_P12 is set but MACOS_SIGN_PASSWORD is not"; fail=1; }
+            if [ "$HAVE_NOTARY_KEY" = true ]; then
+              [ "$HAVE_NOTARY_KEY_ID" = true ] || { echo "::error::MACOS_NOTARY_KEY is set but MACOS_NOTARY_KEY_ID is not"; fail=1; }
+              [ "$HAVE_NOTARY_ISSUER" = true ] || { echo "::error::MACOS_NOTARY_KEY is set but MACOS_NOTARY_ISSUER_ID is not"; fail=1; }
+              echo "macOS: signing and notarizing" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "macOS: signing only (no MACOS_NOTARY_* secrets)" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "::warning::MACOS_SIGN_P12 is not set: the macOS binary ships UNSIGNED. That is fine for curl installs (docs/macos-signing.md)."
+            echo "macOS: unsigned (no MACOS_SIGN_P12)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$fail"
+
+      - name: Install the signing tool
+        run: go install aead.dev/minisign/cmd/minisign@v0.3.0
+
+      # The key exists on disk only for the next step, mode 0600, and is
+      # removed in the always() step below even when the build fails.
+      - name: Write the signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          umask 077
+          keyfile=$(mktemp)
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+          echo "MINISIGN_KEY_FILE=$keyfile" >> "$GITHUB_ENV"
+
+      - name: Tag locally and build (nothing is pushed or published here)
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          gobin=$(go env GOPATH)/bin
+          export PATH="$PATH:$gobin"
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git tag "$TAG"
+          go run github.com/goreleaser/goreleaser/v2@v2.18.3 release --clean --skip=publish
+
+      - name: Remove the signing key
+        if: always()
+        run: |
+          if [ -n "${MINISIGN_KEY_FILE:-}" ]; then rm -f "$MINISIGN_KEY_FILE"; fi
+
+      # The signature must verify against the committed key with the same Go
+      # code `outfit update` uses. A signing secret that does not match the
+      # committed key fails the release here, before anything is published.
+      - name: Verify the signature against internal/update/keys.txt
+        run: go run ./internal/tools/verifysig dist/checksums.txt dist/checksums.txt.minisig
+
+      # Clients already installed trust the keys of the release they run. If this
+      # build is signed with a key that release does not list, none of them could
+      # update to it: that is a key rotation done in the wrong order.
+      - name: Check that the previous release's clients accept the signature
+        run: |
+          if [ -z "$PREVIOUS" ]; then echo "No previous release."; exit 0; fi
+          git show "$PREVIOUS:internal/update/keys.txt" > "$RUNNER_TEMP/previous-keys.txt"
+          if go run ./internal/tools/verifysig dist/checksums.txt dist/checksums.txt.minisig "$RUNNER_TEMP/previous-keys.txt"; then exit 0; fi
+          # Break glass for a LEAKED key (docs/release.md): the owner sets the
+          # repository variable, ships the replacement, and deletes the variable.
+          if [ "$ALLOW_UNTRUSTED_PREVIOUS_KEYS" = true ]; then
+            echo "::warning::ALLOW_UNTRUSTED_PREVIOUS_KEYS is set: releasing a build that clients of $PREVIOUS cannot verify. They must reinstall."
+            exit 0
+          fi
+          echo "::error::this release is signed with a key that $PREVIOUS does not trust, so installed clients would reject it. Ship the new key in a feat:/fix: release first (docs/release.md, 'Rotating the update key'). If the old key LEAKED, see 'If the signing key leaks' there."
+          exit 1
+
+      - name: Gather the release files
+        run: |
+          set -e
+          # A new kind of asset (an SBOM, another archive format) must be added here,
+          # to scripts/release/publish.sh and to install.sh on purpose, not dropped.
+          unknown=$(find dist -maxdepth 1 -type f \
+            ! -name 'outfit_*_linux_amd64.tar.gz' ! -name 'outfit_*_linux_arm64.tar.gz' ! -name 'outfit_*_darwin_all.tar.gz' \
+            ! -name checksums.txt ! -name checksums.txt.minisig ! -name CHANGELOG.md ! -name config.yaml ! -name metadata.json ! -name artifacts.json)
+          if [ -n "$unknown" ]; then
+            echo "::error::GoReleaser produced files this workflow does not publish:"; echo "$unknown"
+            echo "Add them to release.yml, scripts/release/publish.sh and install.sh deliberately."
+            exit 1
+          fi
+          mkdir -p out
+          cp dist/outfit_*.tar.gz dist/checksums.txt dist/checksums.txt.minisig out/
+          ls -l out
+          [ "$(find out -type f | wc -l)" -eq 5 ] || { echo "::error::expected 3 archives, checksums.txt and its signature in out/"; exit 1; }
+          if [ -f dist/CHANGELOG.md ]; then cp dist/CHANGELOG.md notes.md; else printf 'Release %s\n' "$TAG" > notes.md; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-files
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 3. The real artifacts, run natively, before anyone else can ───────────
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    needs: [version, build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      HAVE_P12: ${{ secrets.MACOS_SIGN_P12 != '' }}
+      TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-files
+          path: out
+      # minisign is what lets install.sh check the signature too, against the
+      # key built into the script, so the real key and the real signature meet
+      # here for the first time on every runner.
+      - name: Install minisign
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install minisign; else sudo apt-get update -qq && sudo apt-get install -y -qq minisign; fi
+      - name: Serve the build and install from it
+        run: |
+          set -e
+          mkdir -p "site/releases/latest/download" "site/releases/download/v$VERSION"
+          cp out/* "site/releases/latest/download/"
+          cp out/* "site/releases/download/v$VERSION/"
+          python3 -m http.server 8123 --bind 127.0.0.1 --directory site >server.log 2>&1 &
+          for _ in $(seq 1 30); do curl -fs http://127.0.0.1:8123/releases/latest/download/checksums.txt >/dev/null && break; sleep 1; done
+          export OUTFIT_BASE_URL=http://127.0.0.1:8123 OUTFIT_INSTALL_DIR="$RUNNER_TEMP/bin"
+          # No token: this exercises the public-URL path. (Runners have none, and a
+          # stray one would send the script to the API instead.)
+          unset GH_TOKEN GITHUB_TOKEN OUTFIT_GITHUB_TOKEN
+          sh install.sh | tee install.log
+          grep -q "signature OK" install.log
+          got=$("$OUTFIT_INSTALL_DIR/outfit" version | awk '{print $2}')
+          [ "$got" = "$VERSION" ] || { echo "::error::outfit version says '$got', expected $VERSION"; exit 1; }
+          echo "OUTFIT_BIN=$OUTFIT_INSTALL_DIR/outfit" >> "$GITHUB_ENV"
+      # Before anything is public: a wrong team, a missing hardened runtime or
+      # timestamp, or a binary macOS refuses to run stops the release here.
+      - name: macOS signature
+        if: runner.os == 'macOS' && env.HAVE_P12 == 'true'
+        run: scripts/release/check-macos-signature.sh "$OUTFIT_BIN"
+      - name: Run the demo with the installed binary
+        run: scripts/demo.sh --quick --outfit "$OUTFIT_BIN"
+      - name: outfit update --check against the fake server
+        run: |
+          if "$OUTFIT_BIN" --help 2>&1 | grep -q '^  update'; then
+            OUTFIT_BASE_URL=http://127.0.0.1:8123 "$OUTFIT_BIN" update --check
+          else
+            echo "outfit has no update command in this release yet: skipped"
+          fi
+
+  # ── 3b. Main's own CI must be green for this commit ──────────────────────
+  # ci.yml runs the full test matrix (every git version, both macOS legs) on the
+  # same push. Publishing waits for its `all-green` check, so a red main never
+  # produces a release.
+  ci:
+    name: Wait for CI
+    needs: version
+    if: needs.version.outputs.releasable == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          for _ in $(seq 1 100); do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "all-green")] | sort_by(.id) | (last // {}) | (.conclusion // "pending")' || echo pending)
+            echo "all-green: $state"
+            case "$state" in
+              success) exit 0 ;;
+              failure | cancelled | timed_out | action_required | neutral | skipped)
+                echo "::error::CI on this commit is $state; not releasing."; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "::error::CI did not finish within 50 minutes; not releasing."
+          exit 1
+
+  # ── 4. Publish: tag, then a verified draft-first release ──────────────────
+  publish:
+    name: Publish
+    needs: [version, smoke, ci]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-files
+          path: out
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-notes
+          path: notes
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      # The files sat in artifact storage while four runners installed third-party
+      # packages in the same run, and any job of a run can replace that run's
+      # artifacts. Check them again, with the committed key, right before they
+      # become public.
+      - name: Re-check the files before publishing
+        run: |
+          set -e
+          (cd out && sha256sum -c checksums.txt)
+          go run ./internal/tools/verifysig out/checksums.txt out/checksums.txt.minisig
+      - name: Push the tag
+        run: |
+          set -e
+          sha=$(git rev-parse HEAD)
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            git fetch --quiet origin "refs/tags/$TAG:refs/tags/$TAG"
+            [ "$(git rev-list -n1 "$TAG")" = "$sha" ] || { echo "::error::$TAG already exists on a different commit"; exit 1; }
+            echo "$TAG is already pushed at this commit (re-run)."
+          else
+            git tag "$TAG" "$sha"
+            git push origin "refs/tags/$TAG"
+          fi
+      - name: Publish the release
+        run: scripts/release/publish.sh "$TAG" out notes/notes.md
+
+  # ── 5. The real install, exactly as a teammate does it ────────────────────
+  verify:
+    name: Verify (${{ matrix.os }})
+    needs: [version, publish]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The script is fetched in one step and run in another, never piped from
+      # curl into a shell, and its SHA-256 is logged in between. (Piping is what the
+      # README tells people to do; tests/install-test.sh runs that form against a
+      # fake release. Here the point is the real URL and the real release.)
+      # raw.githubusercontent.com caches for about five minutes, so retry.
+      - name: Download install.sh from the real URL
+        run: |
+          for attempt in $(seq 1 11); do
+            if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o "$RUNNER_TEMP/install.sh" https://raw.githubusercontent.com/prosperity-solutions/outfit/main/install.sh; then
+              exit 0
+            fi
+            echo "attempt $attempt of 11 failed; retrying in 60s"
+            sleep 60
+          done
+          echo "::error::could not download install.sh from raw.githubusercontent.com within ten minutes"
+          exit 1
+      - name: Record the downloaded script's SHA-256
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$RUNNER_TEMP/install.sh"); else sum=$(shasum -a 256 "$RUNNER_TEMP/install.sh"); fi
+          echo "$sum"
+          echo "$sum" >> "$GITHUB_STEP_SUMMARY"
+
+      # The release list can lag a moment behind the flip, so retry once a minute for ten.
+      - name: Install this release and check the version
+        run: |
+          export OUTFIT_INSTALL_DIR="$RUNNER_TEMP/bin"
+          for attempt in $(seq 1 11); do
+            rm -rf "$OUTFIT_INSTALL_DIR"
+            if sh "$RUNNER_TEMP/install.sh"; then
+              got=$("$OUTFIT_INSTALL_DIR/outfit" version | awk '{print $2}')
+              if [ "$got" = "${TAG#v}" ]; then
+                echo "outfit $got installed from the real URL on $RUNNER_OS/$RUNNER_ARCH"
+                exit 0
+              fi
+              echo "installed $got, waiting for $TAG"
+            fi
+            echo "attempt $attempt of 11 failed; retrying in 60s"
+            sleep 60
+          done
+          echo "::error::could not install $TAG within ten minutes"
+          exit 1
+
+      # Only once the previous release itself has `outfit update`; until then it is
+      # reported as not verified, not silently passed.
+      - name: Update from the previous release to this one
+        run: |
+          if [ -z "$PREVIOUS" ]; then
+            echo "No previous release: update path not verified." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/previous"
+          OUTFIT_INSTALL_DIR="$dir" OUTFIT_VERSION="${PREVIOUS#v}" sh "$RUNNER_TEMP/install.sh"
+          [ -x "$dir/outfit" ] || { echo "::error::could not install $PREVIOUS"; exit 1; }
+          if ! "$dir/outfit" --help 2>&1 | grep -q '^  update'; then
+            echo "$PREVIOUS has no 'outfit update': update path not verified." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          "$dir/outfit" update
+          got=$("$dir/outfit" version | awk '{print $2}')
+          [ "$got" = "${TAG#v}" ] || { echo "::error::updated $PREVIOUS but outfit is $got, expected ${TAG#v}"; exit 1; }
+          echo "Updated $PREVIOUS -> $got on $RUNNER_OS/$RUNNER_ARCH."
+
+  # ── 6. macOS signature, when there is one ─────────────────────────────────
+  verify-signing:
+    name: Verify macOS signing
+    needs: [version, publish]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HAVE_P12: ${{ secrets.MACOS_SIGN_P12 != '' }}
+      HAVE_NOTARY: ${{ secrets.MACOS_NOTARY_KEY != '' }}
+      TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check the published binary's signature
+        run: |
+          if [ "$HAVE_P12" != true ]; then
+            echo "No MACOS_SIGN_P12: the macOS binary is unsigned, nothing to verify." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mkdir dl
+          (cd dl && gh release download "$TAG" -p '*_darwin_all.tar.gz' && tar -xzf ./*_darwin_all.tar.gz outfit)
+          scripts/release/check-macos-signature.sh dl/outfit
+          echo "macOS signature verified on the published file (notarization requested: $HAVE_NOTARY)." | tee -a "$GITHUB_STEP_SUMMARY"

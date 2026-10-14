@@ -12,6 +12,9 @@ Nothing in Actions enforces that, and the symptom of a missing guard is a bill
 rather than a failed job -- so this is the drift gate, in the same spirit as the
 other drift gates.
 
+A second gate lives here too: the signing secrets may only be read by
+release.yml, which may only trigger on a push to main (check_secrets).
+
 Usage:
     python3 tests/validate-workflow-gates.py [workflow.yml ...]
     python3 tests/validate-workflow-gates.py --selftest
@@ -22,6 +25,7 @@ silently degrading into a function that returns "fine" for everything.
 Requires PyYAML.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -272,8 +276,51 @@ def check_doc(doc, name):
     return problems
 
 
+# The signing secrets (MINISIGN_*, MACOS_*) belong to release.yml alone, and
+# release.yml must only ever run on a push to main. In a private repository a
+# pull request from a branch in the same repo receives repository secrets, so a
+# later `secrets.X` in any other workflow would put the release key within reach
+# of whoever opens a PR. Nothing else checks this.
+SECRETS_HOME = "release.yml"
+# Every way to read a secret, not just the obvious spelling: `secrets.X`,
+# `secrets['X']`, `toJSON(secrets)`, and `secrets: inherit` into a reusable
+# workflow all expose it. Only expressions are scanned (prose may say "secrets").
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRET_WORD = re.compile(r"\bsecrets\b(?!\.GITHUB_TOKEN\b)(\.[A-Za-z0-9_]+|\[[^\]]*\])?")
+INHERIT = re.compile(r"(?:^|[\s{,])secrets:\s*inherit\b", re.M)
+
+
+def check_secrets(doc, filename, text):
+    problems = []
+    refs = set()
+    for expr in EXPRESSION.findall(text):
+        for m in SECRET_WORD.finditer(expr):
+            refs.add(m.group(0))
+    if INHERIT.search(text):
+        refs.add("secrets: inherit")
+    if filename != SECRETS_HOME and refs:
+        problems.append(
+            f"{filename}: reads secrets ({', '.join(sorted(refs))}); only {SECRETS_HOME} may, "
+            "because it only runs on pushes to main [secrets]"
+        )
+    if filename == SECRETS_HOME:
+        on = doc.get("on", doc.get(True))  # PyYAML reads a bare `on:` key as True
+        ok = (
+            isinstance(on, dict)
+            and set(on) == {"push"}
+            and isinstance(on["push"], dict)
+            and on["push"].get("branches") == ["main"]
+            and set(on["push"]) <= {"branches"}
+        )
+        if not ok:
+            problems.append(f"{filename}: must trigger only on `push: branches: [main]`, it holds the signing secrets")
+    return problems
+
+
 def check(path):
-    return check_doc(yaml.safe_load(path.read_text()), str(label(path)))
+    text = path.read_text()
+    doc = yaml.safe_load(text)
+    return check_doc(doc, str(label(path))) + check_secrets(doc, path.name, text)
 
 
 # ── Self-test ─────────────────────────────────────────────────────────
@@ -519,8 +566,28 @@ SELFTEST = [
 ]
 
 
+SECRET_SELFTEST = [
+    ("secret in ci.yml", "ci.yml", False, "on: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo, env: {K: '${{ secrets.MINISIGN_SECRET_KEY }}'}}]}}"),
+    ("GITHUB_TOKEN anywhere", "ci.yml", True, "on: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo, env: {K: '${{ secrets.GITHUB_TOKEN }}'}}]}}"),
+    ("secrets via bracket", "ci.yml", False, "on: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo, env: {K: \"${{ secrets['MINISIGN_SECRET_KEY'] }}\"}}]}}"),
+    ("toJSON(secrets)", "ci.yml", False, "on: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo, env: {K: '${{ toJSON(secrets) }}'}}]}}"),
+    ("secrets: inherit", "ci.yml", False, "on: {push: {branches: [main]}}\njobs: {a: {uses: ./.github/workflows/x.yml, secrets: inherit}}"),
+    ("prose mentioning secrets", "ci.yml", True, "# the secrets live elsewhere\non: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo secrets}]}}"),
+    ("release.yml on push to main", "release.yml", True, "on: {push: {branches: [main]}}\njobs: {a: {runs-on: x, steps: [{run: echo, env: {K: '${{ secrets.MACOS_SIGN_P12 }}'}}]}}"),
+    ("release.yml also on pull_request", "release.yml", False, "on: {push: {branches: [main]}, pull_request: {}}\njobs: {a: {runs-on: x, steps: [{run: echo}]}}"),
+    ("release.yml on every branch", "release.yml", False, "on: {push: {}}\njobs: {a: {runs-on: x, steps: [{run: echo}]}}"),
+    ("release.yml with a manual trigger", "release.yml", False, "on: {push: {branches: [main]}, workflow_dispatch: {}}\njobs: {a: {runs-on: x, steps: [{run: echo}]}}"),
+]
+
+
 def selftest():
     failures = []
+    for name, filename, should_pass, text in SECRET_SELFTEST:
+        problems = check_secrets(yaml.safe_load(text), filename, text)
+        passed = not problems
+        if passed != should_pass:
+            failures.append(f"  fixture {name!r} should {'pass' if should_pass else 'be rejected'}, got {problems or 'no problems'}")
+        print(f"  {'ok' if passed == should_pass else 'FAIL'}  {name}")
     for name, should_pass, text in SELFTEST:
         problems = check_doc(yaml.safe_load(text), f"<selftest: {name}>")
         passed = not problems
@@ -534,7 +601,7 @@ def selftest():
         for f in failures:
             print(f)
         return 1
-    print(f"Self-test passed ({len(SELFTEST)} fixtures).")
+    print(f"Self-test passed ({len(SELFTEST) + len(SECRET_SELFTEST)} fixtures).")
     return 0
 
 
@@ -561,10 +628,17 @@ def main(argv):
         # Deliberately stdout, not stderr: the two streams interleave
         # unpredictably in an Actions log, and a trailer that lands above the
         # findings it explains is worse than no trailer.
-        print(
-            "\nDraft PRs must not spend runner minutes. See the note above "
-            "`jobs:` in .github/workflows/ci.yml."
-        )
+        if any(not p.endswith("[secrets]") and "must trigger only" not in p for p in problems):
+            print(
+                "\nDraft PRs must not spend runner minutes. See the note above "
+                "`jobs:` in .github/workflows/ci.yml."
+            )
+        if any(p.endswith("[secrets]") or "must trigger only" in p for p in problems):
+            print(
+                "\nThe signing secrets belong to .github/workflows/release.yml alone, which runs "
+                "only on pushes to main (docs/release.md). A pull request from a branch in this "
+                "private repo receives repository secrets."
+            )
         return 1
 
     print(f"Draft-PR gate verified across {len(paths)} workflow file(s).")
