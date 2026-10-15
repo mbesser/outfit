@@ -13,6 +13,7 @@ import (
 
 	"github.com/prosperity-solutions/outfit/internal/apply"
 	"github.com/prosperity-solutions/outfit/internal/config"
+	"github.com/prosperity-solutions/outfit/internal/hooks"
 	"github.com/prosperity-solutions/outfit/internal/plan"
 	"github.com/prosperity-solutions/outfit/internal/profiles"
 	"github.com/prosperity-solutions/outfit/internal/state"
@@ -62,10 +63,24 @@ func syncInput(ctx context.Context, e Env, l *loaded, useHead bool) apply.Input 
 	if l.Profile != nil {
 		// HEAD only while the profile's files are not on disk yet (right after a
 		// switch). Once they are, the disk is the truth, uncommitted files included.
+		var pcfg *config.File
 		if l.Profile.Tier == profiles.Committed && !profiles.RealDir(l.Profile.Dir) {
 			in.Files = profiles.HeadFiles(ctx, l.Git, l.Profile.Name)
+			pcfg = profiles.HeadConfig(ctx, l.Git, l.Profile.Name)
 		} else {
 			in.Files = profiles.Files(*l.Profile)
+			pcfg, _ = profiles.ReadConfig(*l.Profile)
+		}
+		if pcfg != nil {
+			in.ReplaceDirs = pcfg.Replace
+		}
+		if len(in.ReplaceDirs) > 0 {
+			// Where the team's own hooks live, if inside the worktree.
+			if hd := hooks.OriginalDir(l.Cfg, hooks.Dir(r.CommonDir), r.WorkTree, r.CommonDir, e.Getenv("HOME")); hd != "" {
+				if rel, err := filepath.Rel(r.WorkTree, hd); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+					in.HookDirs = append(in.HookDirs, filepath.ToSlash(rel))
+				}
+			}
 		}
 	}
 	if useHead && !in.CommittedProfiles {
@@ -368,6 +383,9 @@ func cmdUse(ctx context.Context, e Env, args []string) int {
 			fmt.Fprintf(e.Stdout, " (%d file(s) swapped)", files)
 		}
 		fmt.Fprintln(e.Stdout)
+		if rs, rerr := state.Read(l.Repo.GitDir); rerr == nil && rs != nil && len(rs.ReplaceDirs) > 0 {
+			fmt.Fprintf(e.Stdout, "  replaces %s: the team's files below are hidden for you (outfit use base brings them back)\n", strings.Join(rs.ReplaceDirs, ", "))
+		}
 	}
 	if shadow != "" {
 		fmt.Fprintf(e.Stderr, "warning: %s\n", shadow)
@@ -528,8 +546,9 @@ func cmdShow(ctx context.Context, e Env, args []string) int {
 			Tier    string   `json:"tier"`
 			Toggles []string `json:"toggles"`
 			Files   []string `json:"files"`
+			Replace []string `json:"replace,omitempty"`
 			Dir     string   `json:"dir,omitempty"`
-		}{prof.Name, string(prof.Tier), nonNilStrings(keys), nonNilStrings(files), personalDir(*prof)})
+		}{prof.Name, string(prof.Tier), nonNilStrings(keys), nonNilStrings(files), replaceOf(cfg), personalDir(*prof)})
 		fmt.Fprintln(e.Stdout, string(out))
 		return ExitOK
 	}
@@ -541,6 +560,9 @@ func cmdShow(ctx context.Context, e Env, args []string) int {
 		fmt.Fprintln(e.Stdout, "toggles  (none)")
 	} else {
 		fmt.Fprintf(e.Stdout, "toggles  %s\n", strings.Join(keys, " "))
+	}
+	if r := replaceOf(cfg); len(r) > 0 {
+		fmt.Fprintf(e.Stdout, "replaces %s (the team's files below are hidden while this profile is active)\n", strings.Join(r, ", "))
 	}
 	if len(files) == 0 {
 		fmt.Fprintln(e.Stdout, "files    (none)")
@@ -873,4 +895,12 @@ func removeNames(a, drop []string) []string {
 		}
 	}
 	return out
+}
+
+// replaceOf is the directories a profile's config says it replaces.
+func replaceOf(cfg *config.File) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Replace
 }

@@ -103,7 +103,7 @@ func (in Input) planOnce(ctx context.Context, st *state.State) (*Result, []plan.
 	res.NeedsHuman = plan.NeedsHuman(acts)
 	for _, a := range acts {
 		switch a.Kind {
-		case plan.Skip, plan.Conflict, plan.QuarantineBoth, plan.QuarantineFile, plan.Stale, plan.RemoveLink:
+		case plan.Skip, plan.Conflict, plan.QuarantineBoth, plan.QuarantineFile, plan.Stale, plan.RemoveLink, plan.SaveStray:
 			if a.Kind == plan.RemoveLink && a.Reason == "" {
 				continue
 			}
@@ -112,7 +112,7 @@ func (in Input) planOnce(ctx context.Context, st *state.State) (*Result, []plan.
 				line += "\n  fix: " + a.Fix
 			}
 			res.Notes = append(res.Notes, line)
-			if a.Kind == plan.QuarantineBoth || a.Kind == plan.QuarantineFile || a.Kind == plan.RemoveLink {
+			if a.Kind == plan.QuarantineBoth || a.Kind == plan.QuarantineFile || a.Kind == plan.RemoveLink || a.Kind == plan.SaveStray {
 				res.Lasting = append(res.Lasting, line)
 			}
 		}
@@ -200,6 +200,12 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 					}
 					res.Changed = true
 				}
+				if a.Unstage {
+					if _, err := in.Git.Write(ctx, "--literal-pathspecs", "update-index", "--force-remove", "--", a.Path); err != nil {
+						return fmt.Errorf("cannot take %s off the index: %w", a.Path, err)
+					}
+					res.Changed = true
+				}
 			case plan.QuarantineFile:
 				if !realParents(in.W.WorkTree, a.Path) {
 					return fmt.Errorf("%s is below a symlinked directory: refusing to act through it", a.Path)
@@ -233,6 +239,17 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 					return err
 				}
 				res.Changed = true
+			case plan.SaveStray:
+				if !realParents(in.W.WorkTree, a.Path) {
+					return fmt.Errorf("%s is below a symlinked directory: refusing to act through it", a.Path)
+				}
+				if created, err := in.quarantine(res, a.Path, true, false); err != nil {
+					// A file too big to copy must not stop the whole sync every time: say so, and
+					// leave it (exit 3 until a person moves it).
+					res.Notes = append(res.Notes, fmt.Sprintf("%s could not be saved (%v): move it somewhere safe yourself, git may remove it", a.Path, err))
+				} else if created {
+					res.Changed = true
+				}
 			case plan.QuarantineBoth:
 				created, err := in.quarantine(res, a.Path, true, true)
 				if err != nil {
@@ -304,6 +321,21 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 	}
 	next.Author = in.Author
 	next.AuthorProfiles = in.AuthorProfiles
+	// The replaced directories, and what the team's files below each looked like when they were
+	// replaced (an acknowledged change moves it): the guard and uninstall read the list, the
+	// plan compares the digest.
+	next.ReplaceDirs, next.ReplaceSeen = nil, nil
+	for _, d := range want.ReplaceDirs {
+		next.ReplaceDirs = append(next.ReplaceDirs, d)
+		if next.ReplaceSeen == nil {
+			next.ReplaceSeen = map[string]string{}
+		}
+		seen := st.ReplaceSeen[d]
+		if seen == "" {
+			seen = facts.Dirs[d].Digest
+		}
+		next.ReplaceSeen[d] = seen
+	}
 	next.CommittedProfiles = in.CommittedProfiles
 	fault.Point("before the state is written")
 	changed, werr := state.Write(in.W.GitDir, &next)

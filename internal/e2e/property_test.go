@@ -103,6 +103,21 @@ func (m *model) dump() string {
 	return b.String()
 }
 
+// replaced reads the directories the active profile replaces from state.json.
+func (m *model) replaced() []string {
+	b, err := os.ReadFile(filepath.Join(m.r.Dir, ".git", "outfit", "state.json"))
+	if err != nil {
+		return nil
+	}
+	var st struct {
+		ReplaceDirs []string `json:"replace_dirs"`
+	}
+	if json.Unmarshal(b, &st) != nil {
+		return nil
+	}
+	return st.ReplaceDirs
+}
+
 func (m *model) swapped() []string {
 	b, err := os.ReadFile(filepath.Join(m.r.Dir, ".git", "outfit", "state.json"))
 	if err != nil {
@@ -159,7 +174,7 @@ func (m *model) newToken() string {
 }
 
 func (m *model) names() []string {
-	return append([]string{"base", "yolo", "lean"}, m.locals...)
+	return append([]string{"base", "yolo", "lean", "repl"}, m.locals...)
 }
 
 type step struct {
@@ -345,6 +360,13 @@ func (m *model) upstreamChange(file string) {
 	// A local commit (the rebase step, commit-everything) makes a fast-forward impossible:
 	// then rebase onto the upstream, like `git pull --rebase`.
 	if _, err := m.git("pull", "-q", "--ff-only", "origin", "main"); err != nil {
+		// The rebase replays local commits, and one that adds a file below a replaced directory
+		// removes that path first, with any unabsorbed save on it (git-behavior row 52, pinned
+		// by replace-dirs-unpushed-rebase.txtar): follow the rule, `outfit sync` after saving.
+		if len(m.replaced()) > 0 && m.pendingAbsorb() {
+			m.logf("outfit sync first: a rebase would remove an unabsorbed save below a replaced directory (git-behavior row 52)")
+			m.outfit("sync")
+		}
 		if _, rerr := m.git("pull", "-q", "--rebase", "origin", "main"); rerr != nil {
 			_, _ = m.git("rebase", "--abort")
 		}
@@ -393,6 +415,15 @@ func (m *model) check(after string) {
 		for _, s := range strings.Split(staged, "\n") {
 			if s == p {
 				m.rt.Fatalf("after %s: the swapped path %s is staged (invariant: never)\n%s", after, p, m.dump())
+			}
+		}
+	}
+	// Nothing staged below a directory the profile replaces (the guard stops the commit, but
+	// outfit itself must never be what stages there).
+	for _, d := range m.replaced() {
+		for _, s := range strings.Split(staged, "\n") {
+			if strings.HasPrefix(s, d+"/") && !unmerged[s] {
+				m.rt.Fatalf("after %s: %s is staged below the replaced directory %s\n%s", after, s, d, m.dump())
 			}
 		}
 	}
@@ -502,6 +533,16 @@ func TestProperties(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		m := &model{t: t, rt: rt, bin: bin, executed: map[string]int{}}
 		m.r = testkit.New(t, testkit.Team, testkit.WithUpstream(), testkit.WithConflictBranch())
+		// A directory the team keeps (skills/) and a profile that replaces it, so `use repl` is
+		// one of the draws: whatever git then does, nothing below skills/ may be staged by outfit
+		// and no user byte may go.
+		m.r.Write("skills/a.md", "team a\n")
+		m.r.Write("skills/b.md", "team b\n")
+		m.r.Write(".outfit/profiles/repl/profile.config", "[outfit \"profile\"]\n    replace = skills\n")
+		m.r.Write(".outfit/profiles/repl/skills/a.md", "my a\n")
+		m.r.Git("add", "skills")
+		m.r.Git("add", "--sparse", "-f", ".outfit/profiles/repl")
+		m.r.Git("commit", "-qm", "feat: replace skills")
 		if o := m.r.RunOutfit(bin, nil, "init"); o.Code != 0 {
 			rt.Fatalf("init: %+v", o)
 		}

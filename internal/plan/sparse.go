@@ -35,7 +35,9 @@ func ValidSwapPath(p string) error {
 			return fmt.Errorf("%q is inside .git", p)
 		}
 	}
-	if p == ".outfit" || strings.HasPrefix(p, ".outfit/") {
+	// (Any case: git matches sparse patterns case-insensitively where core.ignorecase is on, so
+	// `.OUTFIT` would hide the team's .outfit/config as well.)
+	if first, _, _ := strings.Cut(p, "/"); strings.EqualFold(first, ".outfit") {
 		return fmt.Errorf("%q is inside .outfit, which holds the profiles themselves", p)
 	}
 	for _, r := range p {
@@ -73,6 +75,10 @@ func escapePattern(p string) string {
 type SparseOptions struct {
 	// Hidden are the swapped paths (the base files are hidden; links stand in).
 	Hidden []string
+	// HideDirs are directories the active profile replaces as a whole (`!/dir/`): every tracked
+	// file under them is hidden, the team's new ones included, with no sync needed. A swapped
+	// path under one needs no line of its own.
+	HideDirs []string
 	// HideProfiles hides the committed profiles that are not Active. False in
 	// author mode, and when the repository has none.
 	HideProfiles bool
@@ -91,9 +97,19 @@ type SparseOptions struct {
 func SparseText(o SparseOptions) string {
 	var b strings.Builder
 	b.WriteString(Marker + "\n/*\n")
+	dirs := append([]string(nil), o.HideDirs...)
+	sort.Strings(dirs)
+	for i, d := range dirs {
+		if d != "" && (i == 0 || d != dirs[i-1]) {
+			b.WriteString("!/" + escapePattern(d) + "/\n")
+		}
+	}
 	hidden := append([]string(nil), o.Hidden...)
 	sort.Strings(hidden)
 	for _, p := range hidden {
+		if UnderAny(p, dirs) {
+			continue
+		}
 		b.WriteString("!/" + escapePattern(p) + "\n")
 	}
 	if o.HideProfiles {
@@ -123,6 +139,8 @@ func ParseSparse(text string) (o SparseOptions, ok bool) {
 			o.HideProfiles = true
 		case strings.HasPrefix(l, "/"+CommittedRoot+"/") && strings.HasSuffix(l, "/"):
 			o.Show = append(o.Show, unescapePattern(strings.TrimSuffix(strings.TrimPrefix(l, "/"+CommittedRoot+"/"), "/")))
+		case strings.HasPrefix(l, "!/") && strings.HasSuffix(l, "/") && !strings.HasSuffix(l, `\/`):
+			o.HideDirs = append(o.HideDirs, unescapePattern(strings.TrimSuffix(strings.TrimPrefix(l, "!/"), "/")))
 		case strings.HasPrefix(l, "!/"):
 			o.Hidden = append(o.Hidden, unescapePattern(strings.TrimPrefix(l, "!/")))
 		default:
@@ -141,4 +159,14 @@ func unescapePattern(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
+}
+
+// UnderAny reports whether path is inside one of the directories (a directory is not under itself).
+func UnderAny(path string, dirs []string) bool {
+	for _, d := range dirs {
+		if d != "" && strings.HasPrefix(path, d+"/") {
+			return true
+		}
+	}
+	return false
 }
