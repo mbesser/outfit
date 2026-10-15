@@ -117,7 +117,10 @@ jobs:
       - name: go mod verify
         run: go mod verify
       - name: go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          # the fault-injection build (scenario 7) is a different set of files
+          go vet -tags faultinject ./...
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -333,6 +336,53 @@ jobs:
           go install github.com/goreleaser/goreleaser/v2@v2.18.2
           go install aead.dev/minisign/cmd/minisign@v0.3.0
       - run: scripts/ci/signing-smoke.sh
+
+  # Every fuzz target for 20 s (docs/testing.md). The seed corpora already run in `unit`;
+  # this looks for NEW inputs, which differ from run to run: a crash it finds in old code
+  # must not block an unrelated pull request, so the job is NOT in all-green's needs (a red
+  # job is still a red workflow, and the merge policy reads every job). The failing input is
+  # uploaded as an artifact: commit it under testdata/fuzz/<Target>/ and it is a test.
+  fuzz:
+    name: Fuzz (20 s per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - run: scripts/dev/fuzz.sh 20
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failing-input
+          path: internal/**/testdata/fuzz/**
+          if-no-files-found: warn
+
+  # The SOFT performance gate (docs/HANDOVER.md §7.6): `outfit sync` within 10 ms of
+  # `git rev-parse --git-dir`, by hyperfine, Linux only. Not in all-green's needs and
+  # continue-on-error: a noisy runner is a reason to look, never a reason to block. The
+  # hard gate (git processes per command) is in the scenarios, on every OS.
+  perf:
+    name: Performance (soft)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - name: Install hyperfine
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq hyperfine jq
+      - run: scripts/ci/perf-soft.sh
 
   # The single required check. Fails unless every needed job SUCCEEDED. The
   # `commits` and `ship` jobs only exist on pull requests, so on a push to main

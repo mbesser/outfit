@@ -51,6 +51,10 @@ type Input struct {
 	CommittedProfiles bool
 	// Author is author mode: every committed profile stays on disk.
 	Author bool
+	// OperationDone says the git operation that makes the worktree look busy has just
+	// finished: the post-rewrite hook of a rebase runs while git's rebase directory is
+	// still there, but nothing can abort it any more.
+	OperationDone bool
 	// Now is the clock for quarantine directory names (tests set it).
 	Now func() time.Time
 }
@@ -114,6 +118,9 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 	var want plan.Want
 	facts := plan.Facts{Paths: map[string]plan.PathFacts{}, Recorded: map[string]plan.Record{}}
 	facts.SameProfile = in.Profile != nil && st.Profile == in.Profile.Name
+	if !in.OperationDone {
+		facts.GitBusy = gitBusy(in.W.GitDir)
+	}
 
 	var candidates []string
 	if in.Profile != nil {
@@ -167,15 +174,22 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 			}
 		}
 	}
-	// A `<path>~cruft` symlink might be our own link, moved aside by older git during a
-	// merge. Ask the index about it too (the same call): one that git tracks is the
-	// repository's own file and is never ours to remove.
-	cruft := map[string]string{}
+	// A `<path>~cruft` symlink (older git, mid-merge) or a temporary link beside the path (the
+	// cross-filesystem fallback of a link that a kill cut short) might be ours. Ask the index
+	// about them too (the same call): one that git tracks is the repository's own file and is
+	// never ours to remove.
+	strays := map[string]map[string]string{} // path -> stray link (relative) -> its text
 	for _, p := range all {
-		if realParents(in.W.WorkTree, p) {
-			if t, err := os.Readlink(in.abs(p) + "~cruft"); err == nil && t != "" {
-				cruft[p] = t
-				ask = append(ask, p+"~cruft")
+		if !realParents(in.W.WorkTree, p) {
+			continue
+		}
+		for _, stray := range []string{p + "~cruft", tmpLinkPath(p)} {
+			if t, err := os.Readlink(in.abs(stray)); err == nil && t != "" {
+				if strays[p] == nil {
+					strays[p] = map[string]string{}
+				}
+				strays[p][stray] = t
+				ask = append(ask, stray)
 			}
 		}
 	}
@@ -220,9 +234,12 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 		default:
 			pf.FS = plan.Other
 		}
-		if t, ok := cruft[p]; ok && !idx[p+"~cruft"].tracked && !idx[p+"~cruft"].unmerged {
-			pf.CruftLink = t == facts.Recorded[p].Target || (in.Profile != nil && t == in.Target(p))
+		for stray, t := range strays[p] {
+			if !idx[stray].tracked && !idx[stray].unmerged && (t == facts.Recorded[p].Target || (in.Profile != nil && t == in.Target(p))) {
+				pf.StrayLinks = append(pf.StrayLinks, stray)
+			}
 		}
+		sort.Strings(pf.StrayLinks)
 		if in.Profile != nil {
 			pf.VariantHash = hashFile(in.variantPath(p))
 			if v, ok := variantRel[p]; ok {
@@ -328,6 +345,19 @@ func (in Input) sameCommit(ctx context.Context, base, variant string) bool {
 	}
 	res, err = in.Git.Read(ctx, "--literal-pathspecs", "diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", c, "--", variant)
 	return err == nil && strings.TrimSpace(string(res.Stdout)) != ""
+}
+
+// gitBusy names the git operation in progress in the worktree whose git dir this is.
+func gitBusy(gitDir string) string {
+	for _, probe := range []struct{ file, name string }{
+		{"rebase-merge", "rebase"}, {"rebase-apply", "rebase"}, {"MERGE_HEAD", "merge"},
+		{"CHERRY_PICK_HEAD", "cherry-pick"}, {"REVERT_HEAD", "revert"},
+	} {
+		if _, err := os.Lstat(filepath.Join(gitDir, probe.file)); err == nil {
+			return probe.name
+		}
+	}
+	return ""
 }
 
 // sparseNow is the current info/sparse-checkout text ("" when absent).

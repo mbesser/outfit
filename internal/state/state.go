@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/prosperity-solutions/outfit/internal/fault"
 )
 
 // Schema is the current state.json version. Bump it with a migration in Read.
@@ -211,6 +213,7 @@ func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
 		os.Remove(name)
 		return err
 	}
+	fault.Point("a file is written under a temporary name, not yet renamed")
 	if err := os.Rename(name, path); err != nil {
 		os.Remove(name)
 		return err

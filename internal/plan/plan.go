@@ -44,10 +44,12 @@ type PathFacts struct {
 	VariantHash  string // SHA-256 of the variant file; "" when it is missing
 	// VariantExec says the variant file has an executable bit.
 	VariantExec bool
-	// CruftLink says `<path>~cruft` is OUR link, moved aside: older git renames what
-	// stands in the way of a conflict's markers file (the link) to that name, and it
-	// would show up as an untracked symlink that `git add -A` could commit.
-	CruftLink bool
+	// StrayLinks are OUR links standing where they do not belong, untracked: `<path>~cruft`
+	// (older git renames what stands in the way of a conflict's markers file, the link,
+	// to that name) and the temporary name a link is made under before it is renamed into
+	// place (a kill between the two leaves it). Either would show up as an untracked
+	// symlink that `git add -A` could commit.
+	StrayLinks []string
 	// VariantBlob is the blob id the index holds for the variant ("" when the profile
 	// is not committed or the file is not tracked yet).
 	VariantBlob string
@@ -116,6 +118,12 @@ type Facts struct {
 	// committed. Hiding a profile removes its files from disk; a staged-only file
 	// has no other copy, and the next `git reset` would lose it.
 	StagedProfiles []string
+	// GitBusy names the git operation in progress in this worktree ("rebase", "merge",
+	// "cherry-pick", "revert"), or "". git rewrites tracked files by itself during one (a
+	// `rebase --abort` is a hard reset), so a tracked file outfit changed meanwhile can be
+	// reverted behind its back: an editor's save is not absorbed into the profile's
+	// (tracked) file until the operation is over.
+	GitBusy string
 	// SameProfile says the active profile is the one the last sync recorded: a path it
 	// no longer lists then went away from the profile itself (removed), not
 	// because of a switch.
@@ -272,11 +280,11 @@ func Plan(w Want, f Facts) []Action {
 		out = append(out, Action{Kind: SetExpectFiles})
 	}
 
-	// Our own link, moved aside by git for a merge's markers file: remove it at once (it
-	// is untracked, and `git add -A` mid-resolution would commit a symlink).
+	// Our stray links (`~cruft` after a merge, the temporary name of a link whose rename a kill
+	// cut short): remove them at once (they are untracked, and `git add -A` would commit a symlink).
 	for _, p := range sortedKeys(f.Paths) {
-		if f.Paths[p].CruftLink {
-			out = append(out, Action{Kind: RemoveLink, Path: p + "~cruft"})
+		for _, stray := range f.Paths[p].StrayLinks {
+			out = append(out, Action{Kind: RemoveLink, Path: stray})
 		}
 	}
 
@@ -284,7 +292,7 @@ func Plan(w Want, f Facts) []Action {
 	// can bring the base file back.
 	var obsolete []string
 	for p := range f.Recorded {
-		if _, still := want[p]; !still && !inConflict[p] {
+		if _, still := want[p]; !still && !inConflict[p] && !f.Paths[p].Unmerged {
 			obsolete = append(obsolete, p)
 		}
 	}
@@ -368,6 +376,13 @@ func Plan(w Want, f Facts) []Action {
 				// The file and the profile's copy are the same bytes (a person resolved a
 				// quarantine by making them equal): nothing to choose, just relink.
 				out = append(out, Action{Kind: Absorb, Path: p, Target: s.Target})
+			case had && rec.VariantHash == pf.VariantHash && f.GitBusy != "":
+				// The same, but git is in the middle of a rebase/merge: it may reset the tracked
+				// variant (a `rebase --abort`), taking the saved bytes with it. They stay where
+				// they are, in the file the editor wrote, until git is done.
+				out = append(out, Action{Kind: Skip, Path: p,
+					Reason: p + " was replaced by a regular file (an editor's save), and git is in the middle of a " + f.GitBusy + ": the new bytes stay in that file and are copied into the profile once the " + f.GitBusy + " is over",
+					Fix:    "finish or abort the " + f.GitBusy + ", then: outfit sync"})
 			case had && rec.VariantHash == pf.VariantHash:
 				// An editor's atomic save replaced the link. The variant is unchanged since
 				// linking, so the file is the newer copy: absorb it, byte for byte.

@@ -414,3 +414,49 @@ func TestInformationalAndBookkeepingKinds(t *testing.T) {
 		t.Fatal("kinds misclassified")
 	}
 }
+
+func TestPlanNeverTouchesARecordedPathThatIsMidMerge(t *testing.T) {
+	// Found by FuzzPlan: the profile no longer lists a recorded path, and the path is a
+	// conflict-markers file. The "obsolete regular file" step would have saved and removed it.
+	w := Want{}
+	f := Facts{
+		Paths:    map[string]PathFacts{"AGENTS.md": {FS: File, Unmerged: true}},
+		Recorded: map[string]Record{"AGENTS.md": {Target: tgt}},
+	}
+	for _, a := range Plan(w, f) {
+		if a.Path == "AGENTS.md" {
+			t.Fatalf("planned %s on a path in the middle of a merge", a.Kind)
+		}
+	}
+}
+
+func TestPlanRemovesOurStrayLinksNextToASwappedPath(t *testing.T) {
+	w, f := inSync()
+	pf := f.Paths["AGENTS.md"]
+	pf.StrayLinks = []string{".outfit-link~AGENTS.md", "AGENTS.md~cruft"}
+	f.Paths["AGENTS.md"] = pf
+	got := Plan(w, f)
+	var removed []string
+	for _, a := range got {
+		if a.Kind == RemoveLink {
+			removed = append(removed, a.Path)
+		}
+	}
+	if len(removed) != 2 || removed[0] != ".outfit-link~AGENTS.md" || removed[1] != "AGENTS.md~cruft" {
+		t.Fatalf("%v %v", kinds(got), removed)
+	}
+}
+
+func TestPlanDoesNotAbsorbAnEditorsSaveWhileGitIsRebasing(t *testing.T) {
+	w, f := inSync()
+	f.Paths["AGENTS.md"] = PathFacts{FS: File, Tracked: true, SkipWorktree: true, Mode: "100644", FileHash: "new", VariantHash: "h1"}
+	got := Plan(w, f)
+	if len(got) != 1 || got[0].Kind != Absorb {
+		t.Fatalf("idle: %v", kinds(got))
+	}
+	f.GitBusy = "rebase"
+	got = Plan(w, f)
+	if len(got) != 1 || got[0].Kind != Skip || !strings.Contains(got[0].Reason, "in the middle of a rebase") {
+		t.Fatalf("busy: %v %+v", kinds(got), got)
+	}
+}
