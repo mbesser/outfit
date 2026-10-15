@@ -10,6 +10,7 @@ and the same exit code.
 ```sh
 outfit init              # install (idempotent); --dry-run shows what would change
 outfit init --agents     # also a Claude Code SessionStart entry that runs outfit sync
+outfit init --team       # also, once for the repository, tell teammates who do not use outfit (below)
 outfit uninstall         # undo it, in every worktree
 ```
 
@@ -47,6 +48,23 @@ a dangling path can never silently disable your hooks, then removes the `outfit.
 settings made since init (those that were there before are kept), the SessionStart entry and its ignore line, the state files and
 `extensions.worktreeConfig` if init was the one to enable it. `git config --list` comes
 back exactly (a test compares it). Your local and worktree profiles are kept (`--purge` deletes them). If a link or base file cannot be put right it stops there (exit 1, listing it): no hooks, settings or profiles are touched, sparse checkout stays on in that worktree and the record stays, so the rerun continues (worktrees whose links did come off stay undone). Otherwise it does as much as it can and exits 1 listing anything it could not undo.
+
+## `init --team`: telling the people who do not use outfit
+
+Whoever introduces outfit to a repository runs `outfit init --team` once. It adds one line to the
+**base** `AGENTS.md` (*"Optional: this repo supports outfit profiles; see docs/outfit.md to
+install."*) and writes `docs/outfit.md` (what outfit is, the install command for while the
+repository is private and for once it is public, the first commands, and the snippet a hook uses to
+read a toggle with or without outfit). Nothing is committed: the command prints the `git add` and
+`git commit` to run. It is idempotent (the line is added once; an existing `docs/outfit.md` is left
+exactly as it is, so a team's own edits are never overwritten), never writes through a link, and when
+`AGENTS.md` is swapped by your active profile it writes none of the team's files (exit 3, after the
+hooks were installed as usual: `outfit use base` first, so the team's file is the one edited). A link
+the team itself committed (`AGENTS.md -> CLAUDE.md`) is followed while it stays inside the worktree;
+one that cannot be followed, or no `AGENTS.md` at all, gets the document and the line printed for you
+to place. Every check runs before the first write and the document is written before the line that
+points to it, so a failure never leaves the line without its document. `--dry-run` says what it would do. Nothing else changes for non-users
+(docs/HANDOVER.md §3.0).
 
 ## Chaining
 

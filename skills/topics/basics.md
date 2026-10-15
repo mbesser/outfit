@@ -39,7 +39,7 @@ the team. `git status` stays truthful.
 | `outfit promote <name>` | move a local profile into `.outfit/profiles/` so git can version it |
 | `outfit author [on\|off] [profile…]` | show or hide inactive committed profiles' files in the working tree (all or the named ones); bare: what is on disk. Hidden by default |
 | `outfit diff <path>` / `outfit ack <path>` | the base of a swapped file changed under the swap: see it, accept it |
-| `outfit init [--agents]` / `outfit uninstall [--purge]` | install or remove the hook dispatcher (and the Claude Code SessionStart entry) |
+| `outfit init [--agents] [--team]` / `outfit uninstall [--purge]` | install or remove the hook dispatcher (and the Claude Code SessionStart entry); `--team` writes a line in AGENTS.md and docs/outfit.md for teammates without outfit |
 | `outfit update [--check]` | install the newest release |
 | `outfit skills [topic]` | this documentation |
 
