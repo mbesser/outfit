@@ -2,15 +2,20 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/prosperity-solutions/outfit/internal/agents"
+	"github.com/prosperity-solutions/outfit/internal/apply"
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
 	"github.com/prosperity-solutions/outfit/internal/hooks"
 	"github.com/prosperity-solutions/outfit/internal/repo"
+	"github.com/prosperity-solutions/outfit/internal/state"
 )
 
 // cmdHook is what every shim runs: `outfit hook <name> <git's args…>`. It is
@@ -55,6 +60,19 @@ func cmdHook(ctx context.Context, e Env, args []string) int {
 	if e.Getenv(hooks.ActiveEnv) == active {
 		fmt.Fprintf(e.Stderr, "outfit: the %s hook chains back into outfit (a team hook that is a symlink to a shim, or a core.hooksPath that loops): not running it again\n", name)
 		return 0
+	}
+
+	// `git worktree add` fires post-checkout in the NEW worktree with an all-zero old
+	// sha, after copying the main worktree's whole config.worktree into it: that copy
+	// carries `outfit.*` personal settings (a pinned profile) that were never chosen for
+	// this worktree. Strip them first, so it follows the clone's default until
+	// `outfit use --here` says otherwise. The copied hooksPath and sparse settings stay.
+	// Only in a worktree outfit has never synced (no state.json): a deliberate pin made
+	// here with `use --here` has one, so a later all-zero checkout (an orphan branch
+	// switch) cannot take it away.
+	if name == "post-checkout" && len(rest) >= 3 && allZeros(rest[0]) && rest[2] == "1" && r.GitDir != r.CommonDir && neverSynced(r.GitDir) {
+		stripCopiedWorktreeKeys(ctx, e, r)
+		agentsInNewWorktree(ctx, e, r)
 	}
 
 	l, lerr := load(ctx, e)
@@ -112,6 +130,62 @@ func cmdHook(ctx context.Context, e Env, args []string) int {
 		}
 	}
 	return 0
+}
+
+// neverSynced reports a worktree git dir without outfit's state.json.
+func neverSynced(gitDir string) bool {
+	_, err := os.Lstat(state.Path(gitDir))
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// agentsInNewWorktree gives a worktree added later the SessionStart entry the main
+// worktree has (coding agents isolate their work in new worktrees), when it has a
+// .claude directory and git does not track the personal settings file.
+func agentsInNewWorktree(ctx context.Context, e Env, r repo.Repo) {
+	wts := hooks.Worktrees(r.CommonDir)
+	if len(wts) == 0 || wts[0].Path == "" || !agents.Installed(wts[0].Path) || !agents.HasClaude(r.WorkTree) {
+		return
+	}
+	g := gitx.Client{Dir: r.WorkTree}
+	if e.Getenv("GIT_DIR") != "" {
+		g.Env = []string{"GIT_DIR=" + r.GitDir}
+	}
+	if res, err := g.Read(ctx, "--literal-pathspecs", "ls-files", "-z", "--", agents.SettingsFile); err != nil || len(res.Stdout) > 0 {
+		return
+	}
+	if changed, err := agents.Install(r.WorkTree, e.Exe); err != nil || !changed {
+		return
+	}
+	// Keep it out of `git add -A` here too (this branch may lack the ignore line).
+	if _, err := g.Read(ctx, "check-ignore", "-q", "--", agents.SettingsFile); err != nil {
+		_ = apply.AddExcludeEntry(filepath.Join(r.CommonDir, "info", "exclude"), agents.IgnoreComment, agents.IgnoreLine)
+	}
+}
+
+// allZeros reports a git object id made only of zeros (the "null" old sha).
+func allZeros(s string) bool {
+	return s != "" && strings.Trim(s, "0") == ""
+}
+
+// stripCopiedWorktreeKeys unsets every outfit.* key the new worktree's
+// config.worktree inherited. Best effort: a hook must not fail over it.
+func stripCopiedWorktreeKeys(ctx context.Context, e Env, r repo.Repo) {
+	g := gitx.Client{Dir: r.WorkTree}
+	if e.Getenv("GIT_DIR") != "" {
+		g.Env = []string{"GIT_DIR=" + r.GitDir}
+	}
+	res, err := g.Read(ctx, "config", "--worktree", "--name-only", "--list")
+	if err != nil {
+		return // no per-worktree config: nothing was copied
+	}
+	seen := map[string]bool{}
+	for _, k := range strings.Split(string(res.Stdout), "\n") {
+		k = strings.TrimSpace(k)
+		if strings.HasPrefix(k, "outfit.") && !seen[k] {
+			seen[k] = true
+			_, _ = g.Write(ctx, "config", "--worktree", "--unset-all", k)
+		}
+	}
 }
 
 func absFrom(dir, p string) string {

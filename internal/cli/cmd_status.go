@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/prosperity-solutions/outfit/internal/agents"
 	"github.com/prosperity-solutions/outfit/internal/apply"
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
@@ -36,8 +37,11 @@ type statusJSON struct {
 	Toggles []config.Toggle `json:"toggles"`
 	// Dispatcher is the state of the hook dispatcher.
 	Dispatcher dispatcherInfo `json:"dispatcher"`
-	Locked     []string       `json:"locked"`
-	Files      []statusFile   `json:"files"`
+	// AgentsSessionStart says this worktree has outfit's Claude Code SessionStart
+	// entry (`outfit init --agents`).
+	AgentsSessionStart bool         `json:"agents_session_start"`
+	Locked             []string     `json:"locked"`
+	Files              []statusFile `json:"files"`
 	// Sync says whether the worktree matches the active profile (only when outfit
 	// is installed here).
 	Sync     *syncJSON        `json:"sync,omitempty"`
@@ -101,7 +105,8 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 		}
 	}
 	st.Dispatcher = dispatcherHealth(ctx, l, e.Getenv("HOME"))
-	var outOfSync bool
+	st.AgentsSessionStart = agents.Installed(l.Repo.WorkTree)
+	var outOfSync, stale bool
 	if st.Dispatcher.Installed && !st.Dispatcher.OK {
 		outOfSync = true
 		st.Warnings = append(st.Warnings, config.Warning{Source: "hook dispatcher", Message: st.Dispatcher.Problem + ": your team's hooks are NOT running. Fix: outfit init"})
@@ -127,10 +132,12 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 				exit = ExitNeedsHuman
 			case sr.Pending():
 				outOfSync = true
+			case len(sr.Stale()) > 0:
+				stale = true
 			}
 		}
 	}
-	if outOfSync && exit == ExitOK {
+	if (outOfSync || stale) && exit == ExitOK {
 		exit = ExitOutOfSync
 	}
 	if *asJSON {
@@ -197,12 +204,17 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 			fmt.Fprintf(w, "hooks    dispatcher BROKEN: %s\n", st.Dispatcher.Problem)
 		}
 	}
+	if st.AgentsSessionStart {
+		fmt.Fprintln(w, "agents   Claude Code SessionStart entry installed ("+agents.SettingsFile+")")
+	}
 	if syncRes != nil {
 		switch {
 		case syncRes.NeedsHuman || len(syncRes.Refused) > 0:
 			fmt.Fprintln(w, "state    NEEDS A PERSON (see below)")
 		case syncRes.Pending():
 			fmt.Fprintln(w, "state    out of sync: run outfit sync")
+		case len(syncRes.Stale()) > 0:
+			fmt.Fprintf(w, "state    stale: the base differs from when it was swapped under %d file(s) (outfit diff <path>, outfit ack <path>)\n", len(syncRes.Stale()))
 		default:
 			fmt.Fprintln(w, "state    in sync")
 		}

@@ -23,8 +23,9 @@ type Result struct {
 	// Actions are the steps that were planned, informational ones included.
 	Actions []plan.Action `json:"-"`
 	// Lasting is the part of Notes that stays true after a later pass: what was
-	// quarantined, and what gather noticed in the state it read (an ignored record,
-	// an oversize profile). A skip note (a file not on disk yet) does not.
+	// quarantined, a link removed because the profile no longer has its file, and what
+	// gather noticed in the state it read (an ignored record, an oversize profile). A
+	// skip note (a file not on disk yet) does not.
 	Lasting []string `json:"-"`
 	// Done holds the steps earlier passes of one converge carried out: the last
 	// pass of a switch plans nothing, but the switch happened.
@@ -99,13 +100,16 @@ func (in Input) planOnce(ctx context.Context, st *state.State) (*Result, []plan.
 	res.NeedsHuman = plan.NeedsHuman(acts)
 	for _, a := range acts {
 		switch a.Kind {
-		case plan.Skip, plan.Conflict, plan.QuarantineBoth, plan.QuarantineFile:
+		case plan.Skip, plan.Conflict, plan.QuarantineBoth, plan.QuarantineFile, plan.Stale, plan.RemoveLink:
+			if a.Kind == plan.RemoveLink && a.Reason == "" {
+				continue
+			}
 			line := a.Reason
 			if a.Fix != "" {
 				line += "\n  fix: " + a.Fix
 			}
 			res.Notes = append(res.Notes, line)
-			if a.Kind == plan.QuarantineBoth || a.Kind == plan.QuarantineFile {
+			if a.Kind == plan.QuarantineBoth || a.Kind == plan.QuarantineFile || a.Kind == plan.RemoveLink {
 				res.Lasting = append(res.Lasting, line)
 			}
 		}
@@ -116,9 +120,7 @@ func (in Input) planOnce(ctx context.Context, st *state.State) (*Result, []plan.
 // actionable reports whether anything has to be written or run.
 func actionable(acts []plan.Action) bool {
 	for _, a := range acts {
-		switch a.Kind {
-		case plan.Skip, plan.Conflict:
-		default:
+		if !a.Kind.Informational() {
 			return true
 		}
 	}
@@ -138,12 +140,18 @@ func (in Input) now() time.Time {
 func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action, res *Result) (*Result, error) {
 	next := *st
 	quarantined := map[string]bool{}
+	adapted := map[string]bool{} // paths whose recorded base moves (plan.Adapted)
+	for _, a := range acts {
+		if a.Kind == plan.RecordHash && a.Adapted {
+			adapted[a.Path] = true
+		}
+	}
 
 	stepErr := func() error {
 		for _, a := range acts {
 			switch a.Kind {
-			case plan.Skip, plan.Conflict, plan.RecordHash:
-				// Nothing to run; RecordHash only changes the state written below.
+			case plan.Skip, plan.Conflict, plan.RecordHash, plan.Stale:
+				// (plan.ActionKind.Informational / Bookkeeping: nothing to run; RecordHash only changes the state written below.
 			case plan.SetExpectFiles:
 				if _, err := in.Git.Write(ctx, "config", "--worktree", "sparse.expectFilesOutsideOfPatterns", "true"); err != nil {
 					return fmt.Errorf("cannot set sparse.expectFilesOutsideOfPatterns: %w", err)
@@ -233,14 +241,29 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 	for _, sw := range want.Swaps {
 		pf := facts.Paths[sw.Path]
 		switch {
-		case quarantined[sw.Path]:
+		case quarantined[sw.Path] || pf.Unmerged:
+			// (a path in the middle of a merge keeps its record too: the base it stood on is
+			// what the merge's result is compared with afterwards)
 			for _, old := range st.Swaps {
 				if old.Path == sw.Path {
 					next.Swaps = append(next.Swaps, old)
 				}
 			}
 		case pf.FS == plan.Link && pf.LinkTarget == sw.Target && pf.Tracked && pf.VariantHash != "":
-			next.Swaps = append(next.Swaps, state.Swap{Path: sw.Path, Target: sw.Target, VariantHash: pf.VariantHash, BaseBlob: g.blobs[sw.Path]})
+			// The base blob the swap stands on: the first link sets it, an `ack` or an adapted
+			// commit (plan.Adapted, decided by the plan) moves it, an ordinary sync never
+			// does, or "stale" would clear itself the next time anything else changed.
+			base := g.blobs[sw.Path]
+			var known []string
+			for _, old := range st.Swaps {
+				if old.Path == sw.Path && old.Target == sw.Target && old.BaseBlob != "" {
+					known = old.KnownBases
+					if !adapted[sw.Path] { // the plan decided (plan.Adapted): one commit moved base and variant
+						base = old.BaseBlob
+					}
+				}
+			}
+			next.Swaps = append(next.Swaps, state.Swap{Path: sw.Path, Target: sw.Target, VariantHash: pf.VariantHash, VariantBlob: pf.VariantBlob, BaseBlob: base, SeenBase: g.blobs[sw.Path], KnownBases: known})
 		}
 	}
 	sort.Slice(next.Swaps, func(i, j int) bool { return next.Swaps[i].Path < next.Swaps[j].Path })
@@ -451,7 +474,10 @@ func (in Input) quarantine(res *Result, path string, file, withVariant bool) (cr
 
 // addExclude appends outfit's entry to .git/info/exclude, keeping every line a
 // person wrote.
-func addExclude(path string) error {
+func addExclude(path string) error { return AddExcludeEntry(path, excludeComment, excludeLine) }
+
+// AddExcludeEntry appends a comment line and a pattern line to an exclude file.
+func AddExcludeEntry(path, comment, line string) error {
 	old, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -460,13 +486,19 @@ func addExclude(path string) error {
 	if text != "" && !strings.HasSuffix(text, "\n") {
 		text += "\n"
 	}
-	text += excludeComment + "\n" + excludeLine + "\n"
+	text += comment + "\n" + line + "\n"
 	return state.WriteFileAtomic(path, []byte(text), 0o644)
 }
 
-// RemoveExclude takes outfit's entry back out of .git/info/exclude, only the lines
-// it added.
+// RemoveExclude takes outfit's own .outfit entry out of .git/info/exclude: the comment
+// line and the pattern line after it, never one a person wrote.
 func RemoveExclude(path string) (bool, error) {
+	return RemoveExcludeEntry(path, excludeComment, excludeLine)
+}
+
+// RemoveExcludeEntry removes the entry AddExcludeEntry wrote: the comment line and
+// the line right after it, nothing a person wrote.
+func RemoveExcludeEntry(path, comment, line string) (bool, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -480,9 +512,9 @@ func RemoveExclude(path string) (bool, error) {
 	removed := false
 	lines := strings.Split(string(b), "\n")
 	for i := 0; i < len(lines); i++ {
-		if lines[i] == excludeComment {
+		if lines[i] == comment {
 			removed = true
-			if i+1 < len(lines) && lines[i+1] == excludeLine {
+			if i+1 < len(lines) && lines[i+1] == line {
 				i++
 			}
 			continue
@@ -542,11 +574,20 @@ func (r *Result) Pending() bool {
 		return true
 	}
 	for _, a := range r.Actions {
-		switch a.Kind {
-		case plan.Skip, plan.Conflict, plan.RecordHash:
-		default:
+		if !a.Kind.Informational() && !a.Kind.Bookkeeping() {
 			return true
 		}
 	}
 	return false
+}
+
+// Stale lists the swaps whose base file differs from when outfit swapped it.
+func (r *Result) Stale() []plan.Action {
+	var out []plan.Action
+	for _, a := range r.Actions {
+		if a.Kind == plan.Stale {
+			out = append(out, a)
+		}
+	}
+	return out
 }

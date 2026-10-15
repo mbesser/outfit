@@ -1,0 +1,57 @@
+# Scenario 9 (docs/HANDOVER.md §7.4): `git worktree add` gets its links, the
+# outfit.profile copied from the main worktree's config.worktree is stripped (so the
+# new worktree follows the clone's default), and `use --here` still overrides.
+# The copied core.hooksPath stays.
+fixture repo team
+cd repo
+outfit init
+outfit use lean --here
+exec git config --worktree --get outfit.profile
+stdout '^lean$'
+outfit use yolo
+# The main worktree pins lean for itself; the clone's default is yolo.
+exec git config --local --get outfit.profile
+stdout '^yolo$'
+
+exec git worktree add -q ../repo-new
+# The new worktree did NOT inherit the pin: it follows the clone's default and has
+# its links.
+cd ../repo-new
+! exec git config --worktree --get outfit.profile
+exec git config --get outfit.profile
+stdout '^yolo$'
+islink AGENTS.md .outfit/profiles/yolo/AGENTS.md
+exec git status --short
+! stdout .
+# The copied hooksPath is kept, so hooks run there.
+exec git config --worktree --get core.hooksPath
+stdout 'outfit/hooks'
+outfit status
+stdout 'profile  yolo'
+stdout 'state    in sync'
+
+# `use --here` overrides again, and the main worktree keeps its own pin.
+outfit use base --here
+! islink AGENTS.md
+cd ../repo
+exec git config --worktree --get outfit.profile
+stdout '^lean$'
+
+# `git worktree add --no-checkout` fires no hook, so the copied pin stays (documented).
+exec git worktree add -q --no-checkout ../repo-nc
+exec git -C ../repo-nc config --worktree --get outfit.profile
+stdout '^lean$'
+exec git worktree remove --force ../repo-nc
+
+# The strip is for a NEW linked worktree only. A zero-sha post-checkout in the main
+# worktree (a clone's first checkout looks like this) keeps the pin it has...
+exec sh -c 'outfit hook post-checkout 0000000000000000000000000000000000000000 $(git rev-parse HEAD) 1'
+exec git config --worktree --get outfit.profile
+stdout '^lean$'
+# ...and so does a linked worktree that outfit has already synced: its pin was
+# chosen there (an orphan-branch switch fires the same hook).
+cd ../repo-new
+outfit use lean --here
+exec sh -c 'outfit hook post-checkout 0000000000000000000000000000000000000000 $(git rev-parse HEAD) 1'
+exec git config --worktree --get outfit.profile
+stdout '^lean$'

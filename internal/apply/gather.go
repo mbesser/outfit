@@ -113,6 +113,7 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 	g := &gathered{blobs: map[string]string{}}
 	var want plan.Want
 	facts := plan.Facts{Paths: map[string]plan.PathFacts{}, Recorded: map[string]plan.Record{}}
+	facts.SameProfile = in.Profile != nil && st.Profile == in.Profile.Name
 
 	var candidates []string
 	if in.Profile != nil {
@@ -143,7 +144,7 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 			g.messages = append(g.messages, "ignored a recorded swap: "+err.Error())
 			continue
 		}
-		facts.Recorded[s.Path] = plan.Record{Target: s.Target, VariantHash: s.VariantHash}
+		facts.Recorded[s.Path] = plan.Record{Target: s.Target, VariantHash: s.VariantHash, VariantBlob: s.VariantBlob, BaseBlob: s.BaseBlob, SeenBase: s.SeenBase, KnownBases: s.KnownBases}
 	}
 
 	// Which of those paths does git know, and in what state?
@@ -154,9 +155,33 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 		}
 	}
 	sort.Strings(all)
+	ask := append([]string(nil), all...)
+	// A committed profile's variants are asked about too: git's blob for one tells a
+	// pull that changed the profile from an edit made through the link.
+	variantRel := map[string]string{}
+	if in.Profile != nil && in.Profile.Tier == profiles.Committed {
+		for _, p := range candidates {
+			if rel, err := filepath.Rel(in.W.WorkTree, in.variantPath(p)); err == nil && !strings.HasPrefix(rel, "..") {
+				variantRel[p] = filepath.ToSlash(rel)
+				ask = append(ask, variantRel[p])
+			}
+		}
+	}
+	// A `<path>~cruft` symlink might be our own link, moved aside by older git during a
+	// merge. Ask the index about it too (the same call): one that git tracks is the
+	// repository's own file and is never ours to remove.
+	cruft := map[string]string{}
+	for _, p := range all {
+		if realParents(in.W.WorkTree, p) {
+			if t, err := os.Readlink(in.abs(p) + "~cruft"); err == nil && t != "" {
+				cruft[p] = t
+				ask = append(ask, p+"~cruft")
+			}
+		}
+	}
 	idx := map[string]indexEntry{}
 	if len(all) > 0 {
-		args := append([]string{"--literal-pathspecs", "ls-files", "-s", "-t", "-z", "--"}, all...)
+		args := append([]string{"--literal-pathspecs", "ls-files", "-s", "-t", "-z", "--"}, ask...)
 		res, err := in.Git.Read(ctx, args...)
 		if err != nil {
 			return want, facts, g, fmt.Errorf("cannot read the index: %w", err)
@@ -170,6 +195,7 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 		ie := idx[p]
 		pf.Tracked, pf.SkipWorktree, pf.Unmerged, pf.Mode = ie.tracked, ie.skip, ie.unmerged, ie.mode
 		g.blobs[p] = ie.blob
+		pf.BaseBlob = ie.blob
 
 		fi, err := os.Lstat(in.abs(p))
 		switch {
@@ -194,8 +220,14 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 		default:
 			pf.FS = plan.Other
 		}
+		if t, ok := cruft[p]; ok && !idx[p+"~cruft"].tracked && !idx[p+"~cruft"].unmerged {
+			pf.CruftLink = t == facts.Recorded[p].Target || (in.Profile != nil && t == in.Target(p))
+		}
 		if in.Profile != nil {
 			pf.VariantHash = hashFile(in.variantPath(p))
+			if v, ok := variantRel[p]; ok {
+				pf.VariantBlob = idx[v].blob
+			}
 			if vi, err := os.Stat(in.variantPath(p)); err == nil {
 				pf.VariantExec = vi.Mode()&0o111 != 0
 			}
@@ -203,6 +235,20 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 		facts.Paths[p] = pf
 	}
 	// (A recorded path the profile no longer lists has no variant; hashFile gives "".)
+
+	// Both the base and the profile's file moved since the last sync: was it ONE commit
+	// that touched both (the maintainer adapting the profile)? Only then the swap may
+	// stand on the new base without a person looking. Rare, so a git call each is fine.
+	for _, p := range candidates {
+		rec, ok := facts.Recorded[p]
+		pf := facts.Paths[p]
+		probe := pf
+		probe.SameCommit = true
+		if ok && variantRel[p] != "" && plan.Adapted(rec, probe) {
+			pf.SameCommit = in.sameCommit(ctx, p, variantRel[p])
+			facts.Paths[p] = pf
+		}
+	}
 
 	// "Untouched" is decided by git, which applies .gitattributes, autocrlf and
 	// clean/smudge filters and notices a mode change: raw bytes cannot.
@@ -219,9 +265,21 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 	}
 
 	var hidden []string
+	// A path in the middle of a merge keeps the pattern state it has: git leaves an
+	// unmerged file in place whatever the patterns say, and a rewrite that "unhides" it
+	// would only make git complain.
+	curSparse, _ := plan.ParseSparse(sparseNow(in.W.GitDir))
+	wasHidden := map[string]bool{}
+	for _, h := range curSparse.Hidden {
+		wasHidden[h] = true
+	}
 	for _, p := range candidates {
 		pf := facts.Paths[p]
 		want.Swaps = append(want.Swaps, plan.Swap{Path: p, Target: in.Target(p)})
+		if pf.Unmerged && wasHidden[p] {
+			hidden = append(hidden, p)
+			continue
+		}
 		if pf.Tracked && !pf.Unmerged && pf.Mode != "120000" && pf.VariantHash != "" && (pf.FS == plan.Missing || pf.FS == plan.Link || pf.FS == plan.File) {
 			hidden = append(hidden, p)
 		}
@@ -271,6 +329,20 @@ func IsJunk(n string) bool {
 		}
 	}
 	return strings.HasPrefix(n, ".#") || (len(n) > 2 && strings.HasPrefix(n, "#") && strings.HasSuffix(n, "#"))
+}
+
+// sameCommit reports whether the latest commit that touched base also touched variant.
+func (in Input) sameCommit(ctx context.Context, base, variant string) bool {
+	res, err := in.Git.Read(ctx, "--literal-pathspecs", "log", "-1", "--format=%H", "--", base)
+	if err != nil {
+		return false
+	}
+	c := strings.TrimSpace(string(res.Stdout))
+	if c == "" {
+		return false
+	}
+	res, err = in.Git.Read(ctx, "--literal-pathspecs", "diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", c, "--", variant)
+	return err == nil && strings.TrimSpace(string(res.Stdout)) != ""
 }
 
 // sparseNow is the current info/sparse-checkout text ("" when absent).
