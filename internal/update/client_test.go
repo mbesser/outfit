@@ -63,7 +63,7 @@ func TestFetchThroughTheAPIWithAToken(t *testing.T) {
 	f.Private, f.Token = true, "ghp_secrettoken123"
 	f.Add("0.2.0")
 	c := newClient(f)
-	c.Token = Token{Value: "ghp_secrettoken123", Source: "GH_TOKEN"}
+	c.Token = Token{Value: "ghp_secrettoken123", Source: "OUTFIT_GITHUB_TOKEN"}
 
 	p, err := c.Fetch(context.Background(), nil)
 	if err != nil || p.Version.String() != "0.2.0" {
@@ -94,7 +94,7 @@ func TestFetchThroughTheAPIWithAToken(t *testing.T) {
 	}
 }
 
-func TestPrivateRepositoryErrorsNameTheFix(t *testing.T) {
+func TestPrivateForkErrorsNameTheFix(t *testing.T) {
 	f := testkit.NewFakeRelease(t, plat)
 	f.Private, f.Token = true, "ghp_right"
 	f.Add("0.2.0")
@@ -102,20 +102,39 @@ func TestPrivateRepositoryErrorsNameTheFix(t *testing.T) {
 	// No token: the public URLs answer 404.
 	_, err := newClient(f).Fetch(context.Background(), nil)
 	var ue *Error
-	if !errors.As(err, &ue) || !strings.Contains(ue.Fix, "gh auth login") || !strings.Contains(ue.Fix, "OUTFIT_GITHUB_TOKEN") {
+	if !errors.As(err, &ue) || !strings.Contains(ue.Msg, "HTTP 404") || strings.Contains(ue.Fix+ue.Msg, "gh auth") {
 		t.Fatalf("no-token error = %#v", err)
 	}
 	// A wrong token: names where it came from, never its value.
 	c := newClient(f)
-	c.Token = Token{Value: "ghp_wrongtoken", Source: "GITHUB_TOKEN"}
+	c.Token = Token{Value: "ghp_wrongtoken", Source: "OUTFIT_GITHUB_TOKEN"}
 	_, err = c.Fetch(context.Background(), nil)
-	if !errors.As(err, &ue) || !strings.Contains(ue.Msg, "GITHUB_TOKEN") || strings.Contains(ue.Msg+ue.Fix, "ghp_wrongtoken") {
+	if !errors.As(err, &ue) || !strings.Contains(ue.Msg, "OUTFIT_GITHUB_TOKEN") || !strings.Contains(ue.Fix, "unset OUTFIT_GITHUB_TOKEN") || strings.Contains(ue.Msg+ue.Fix, "ghp_wrongtoken") {
 		t.Fatalf("wrong-token error = %#v", err)
 	}
 }
 
+func TestStatusErrorsWithoutATokenSayWhatHappened(t *testing.T) {
+	c := &Client{}
+	u := &url.URL{Scheme: "https", Host: "github.com", Path: "/x/checksums.txt"}
+	for status, want := range map[int]string{404: "that release does not exist", 403: "a rate limit or a proxy", 401: "a rate limit or a proxy"} {
+		err := c.statusError(u, status, false)
+		var ue *Error
+		if !errors.As(err, &ue) || !strings.Contains(ue.Msg, want) || strings.Contains(ue.Msg+ue.Fix, "gh auth") {
+			t.Errorf("HTTP %d without a token: %#v", status, err)
+		}
+		if status != 404 && !strings.Contains(ue.Fix, "OUTFIT_GITHUB_TOKEN") {
+			t.Errorf("HTTP %d: the fix must name OUTFIT_GITHUB_TOKEN: %q", status, ue.Fix)
+		}
+	}
+	var ue *Error
+	if err := c.statusError(u, 503, false); !errors.As(err, &ue) || !ue.Retryable {
+		t.Errorf("a 5xx is worth a retry: %v", err)
+	}
+}
+
 func TestTokenIsNeverSentInTheClear(t *testing.T) {
-	c := &Client{APIURL: "http://example.invalid/api", Token: Token{Value: "ghp_x", Source: "GH_TOKEN"}, Keys: testkit.NewFakeRelease(t, plat).Keys, GOOS: "linux", GOARCH: "amd64"}
+	c := &Client{APIURL: "http://example.invalid/api", Token: Token{Value: "ghp_x", Source: "OUTFIT_GITHUB_TOKEN"}, Keys: testkit.NewFakeRelease(t, plat).Keys, GOOS: "linux", GOARCH: "amd64"}
 	_, err := c.Fetch(context.Background(), nil)
 	if err == nil || !strings.Contains(err.Error(), "refusing to send a GitHub token") {
 		t.Fatalf("err = %v", err)
@@ -216,28 +235,19 @@ func TestParseVersion(t *testing.T) {
 	}
 }
 
-func TestFindTokenOrderAndCharacters(t *testing.T) {
-	env := map[string]string{"GITHUB_TOKEN": "c", "GH_TOKEN": "b", "OUTFIT_GITHUB_TOKEN": "a"}
+func TestFindTokenReadsOnlyOutfitGithubToken(t *testing.T) {
+	env := map[string]string{"GITHUB_TOKEN": "c", "GH_TOKEN": "b"}
 	get := func(k string) string { return env[k] }
-	gh := func() string { return "fromgh" }
-	if tok, _ := FindToken(get, gh); tok.Value != "a" || tok.Source != "OUTFIT_GITHUB_TOKEN" {
+	if tok, _ := FindToken(get); tok.Value != "" {
+		t.Fatalf("an ambient GH_TOKEN or GITHUB_TOKEN must not be used: %+v", tok)
+	}
+	env["OUTFIT_GITHUB_TOKEN"] = " a "
+	if tok, _ := FindToken(get); tok.Value != "a" || tok.Source != "OUTFIT_GITHUB_TOKEN" {
 		t.Fatalf("tok = %+v", tok)
 	}
-	delete(env, "OUTFIT_GITHUB_TOKEN")
-	if tok, _ := FindToken(get, gh); tok.Source != "GH_TOKEN" {
-		t.Fatalf("tok = %+v", tok)
-	}
-	delete(env, "GH_TOKEN")
-	delete(env, "GITHUB_TOKEN")
-	if tok, _ := FindToken(get, gh); tok.Source != "gh auth token" || tok.Value != "fromgh" {
-		t.Fatalf("tok = %+v", tok)
-	}
-	if tok, _ := FindToken(get, nil); tok.Value != "" {
-		t.Fatalf("a nil gh must not be called: %+v", tok)
-	}
-	env["GH_TOKEN"] = "bad token\"quote"
-	tok, ignored := FindToken(get, gh)
-	if tok.Value != "" || !strings.Contains(ignored, "GH_TOKEN") || strings.Contains(ignored, "quote") {
+	env["OUTFIT_GITHUB_TOKEN"] = "bad token\"quote"
+	tok, ignored := FindToken(get)
+	if tok.Value != "" || !strings.Contains(ignored, "OUTFIT_GITHUB_TOKEN") || strings.Contains(ignored, "quote") {
 		t.Fatalf("tok = %+v ignored = %q", tok, ignored)
 	}
 }
@@ -317,7 +327,7 @@ func TestTokenGoesOnlyToTheRealAPIHostOrThisMachine(t *testing.T) {
 	}
 	// And the client enforces it: a token with an https API URL elsewhere is refused
 	// before any request is made.
-	c := &Client{APIURL: "https://evil.example/api", Token: Token{Value: "ghp_x", Source: "GH_TOKEN"}, Keys: testkit.NewFakeRelease(t, plat).Keys, GOOS: "linux", GOARCH: "amd64"}
+	c := &Client{APIURL: "https://evil.example/api", Token: Token{Value: "ghp_x", Source: "OUTFIT_GITHUB_TOKEN"}, Keys: testkit.NewFakeRelease(t, plat).Keys, GOOS: "linux", GOARCH: "amd64"}
 	if _, err := c.Latest(context.Background()); err == nil || !strings.Contains(err.Error(), "refusing to send a GitHub token") {
 		t.Fatalf("err = %v", err)
 	}
@@ -329,7 +339,7 @@ func TestRedirectToPlainHTTPIsRefused(t *testing.T) {
 	f.Add("0.2.0")
 	f.Break.InsecureRedirect = true
 	c := newClient(f)
-	c.Token = Token{Value: "ghp_ok", Source: "GH_TOKEN"}
+	c.Token = Token{Value: "ghp_ok", Source: "OUTFIT_GITHUB_TOKEN"}
 	_, err := c.Fetch(context.Background(), nil)
 	if err == nil || !strings.Contains(err.Error(), "refusing a redirect") {
 		t.Fatalf("err = %v", err)

@@ -62,15 +62,33 @@ locally with `zizmor .github/workflows` (`brew install zizmor`).
 
 ## What only the owner can switch on
 
-outfit's automation is not allowed to change repository settings. These are worth doing in
-Settings of `prosperity-solutions/outfit` (all were **disabled** when checked):
+outfit's automation is not allowed to change repository settings. The repository is **public**, which
+makes the settings below matter more: anyone can open a pull request, and a workflow run is the one
+place a secret could leak. **One command does the settings that need no secret**, as a repository admin:
 
-| Setting | Where | Effect |
-|---|---|---|
-| Secret scanning and push protection | Code security | a committed key is blocked at push |
-| Dependabot security updates | Code security | pull requests for vulnerable dependencies |
-| **First:** the `release` environment (it exists after the first release run): deployment branches = `main`, then move the seven signing secrets from the repository into it | Environments | until then they are repository secrets, which a pull request from a branch of this repository can read by editing a workflow (a fork's pull request cannot). After, only a run on `main` can |
-| "Require review from code owners" on the `main` ruleset (the ruleset itself exists, see below) | Rules | `.github/CODEOWNERS` names who must look at workflows, `install.sh`, the update keys and the release scripts; with the setting on, a change to them waits for that person |
+```sh
+scripts/dev/harden-public-repo.sh
+```
+
+| Setting (what the script sets) | Effect |
+|---|---|
+| The workflow token starts read-only (`default_workflow_permissions: read`) | each workflow asks for the permissions it needs; none inherits write by default (they all declare theirs, `zizmor` checks it) |
+| SHA pinning required for actions | a workflow that uses an action by tag or branch cannot run; every action here is pinned by SHA, and the dependency-age gate keeps it so |
+| The `release` environment may deploy from `main` only | a run on any other branch cannot use what the environment holds |
+| Secret scanning and push protection | a committed key is blocked at push |
+| Dependabot security updates | pull requests for vulnerable dependencies |
+| Private vulnerability reporting | `SECURITY.md` points reporters to it |
+
+These are **already as strict as they can be** (checked): fork pull requests need approval before a workflow
+runs for an outside contributor (`all_external_contributors`), and a fork's pull request never receives a
+secret or a write token. No workflow uses `pull_request_target` (`zizmor` flags one that does).
+
+Two more are yours and cannot be scripted by the agent:
+
+| What | Why |
+|---|---|
+| **Move the seven signing secrets into the `release` environment** (Settings > Environments > `release` > Secrets), then delete the repository-level copies | they are repository secrets today, which a pull request from a *branch of this repository* (a collaborator, not a fork) can read by editing a workflow. In the environment, with the branch rule above, only a run on `main` can. outfit never reads, writes or moves a secret |
+| "Require review from code owners" on the `main` ruleset (the ruleset itself exists, see below) | `.github/CODEOWNERS` names who must look at workflows, `install.sh`, the update keys and the release scripts; with the setting on, a change to them waits for that person |
 
 ## The ruleset on `main`
 
@@ -89,3 +107,17 @@ default branch:
 Releases push **tags** only, so the ruleset does not touch them. Change it under Settings > Rules; to
 recreate it, `gh api -X POST repos/<owner>/<repo>/rulesets` with the JSON of the existing one
 (`gh api repos/<owner>/<repo>/rulesets/<id>`).
+
+## Known limits
+
+- **Nothing signed says which release is the latest.** The signature covers `checksums.txt` (and so the
+  archive's hash and its version in the file name), not a "this is the newest release" statement. Someone
+  with write access to the releases could put an older signed build under a newer release or mark an
+  older release as latest: a fresh install gets that old, genuinely signed build, and `outfit update`
+  says "up to date". The token path's tag comparison narrows this a little; a seal would need the
+  version in the signed data. Write access to the repository is what an attacker would need, which is
+  why the ruleset, the `release` environment and the stamp rules above matter.
+- **The stamp is a workflow nudge, not a gate against strangers.** Its key is in the public source, and a
+  pull request from a fork runs its own copy of `ci.yml`: a green `Ship Workflow` or `all-green` on a
+  fork's pull request proves nothing. Merging needs write access, so the model holds through review.
+- The git history carries the maintainer's commit address.
