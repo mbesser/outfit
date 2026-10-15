@@ -27,7 +27,12 @@ func Teardown(ctx context.Context, w Workspace) (did []string, failed []string) 
 		return nil, []string{"state file of " + w.WorkTree + ": " + err.Error()}
 	}
 	g := gitx.Client{Dir: w.WorkTree}
-	if w.WorkTree == "" || !dirExists(w.WorkTree) {
+	if w.WorkTree == "" {
+		// Never "a deleted checkout": an unknown path means links may still stand
+		// somewhere outfit cannot see, and the record must stay for the rerun.
+		return nil, []string{"the path of the worktree with git dir " + w.GitDir + " is unknown (a separate git dir whose config has no core.worktree)"}
+	}
+	if !dirExists(w.WorkTree) {
 		// The checkout was deleted by hand (not yet pruned): its links went with it and
 		// there is no index to restore. Only the settings in its git dir are left.
 		if st.SparseSet {
@@ -64,10 +69,18 @@ func Teardown(ctx context.Context, w Workspace) (did []string, failed []string) 
 			did = append(did, "link "+s.Path)
 			restore = append(restore, s.Path)
 		case err == nil:
-			failed = append(failed, s.Path+" is a regular file where outfit's link was: left alone (its bytes are yours)")
+			failed = append(failed, s.Path+" is a regular file where outfit's link was: left alone (its bytes are yours; `outfit sync` absorbs an editor's save into the profile, or saves both copies when the profile changed too, then rerun)")
 		default:
 			restore = append(restore, s.Path)
 		}
+	}
+
+	// A link that could not be removed (or a regular file where one was) stops here:
+	// sparse checkout stays on, because switching it off while a link still stands at a
+	// tracked path shows ` T` in status and lets `commit -a` commit the symlink. The
+	// rerun, which still has the record, continues from this point.
+	if len(failed) > 0 {
+		return did, failed
 	}
 
 	sparseText, _ := readInside(w.GitDir, "info/sparse-checkout")

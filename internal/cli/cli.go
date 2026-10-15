@@ -38,6 +38,9 @@ type Env struct {
 	Stdin io.Reader
 	// Exe is the absolute path of the running binary, recorded in hook shims.
 	Exe string
+	// OwnRepo makes every git call of this Env ignore the repository variables this process
+	// inherited (see gitx.Client.OwnRepo): set when working on another worktree.
+	OwnRepo bool
 	// IsTTY reports whether stderr is a terminal (the update banner only shows
 	// there).
 	IsTTY bool
@@ -110,9 +113,12 @@ commands:
   init [--agents] [--dry-run]
                          install the hook dispatcher (git hooks keep working); --agents also adds a
                          Claude Code SessionStart entry that runs outfit sync
-  uninstall              remove everything init installed, in every worktree
+  uninstall [--purge]    remove everything init installed, in every worktree (your local and worktree
+                         profiles stay; --purge deletes them)
   get <key>              print a toggle's value (exit 1 when unset)
   set <key>=<val>…       personal toggle override; key= unsets   [--here | --global]
+  new <name>             make a personal profile (local; --here: for this worktree only); --from <profile>
+  promote <name>         move a local profile into .outfit/profiles/ so git can version it
   use <profile> [--here] switch the clone's (or this worktree's) profile and sync
   sync                   make the files match the active profile (hooks and agents run it)
   ls                     list profiles across the three tiers
@@ -157,6 +163,10 @@ func dispatch(ctx context.Context, e Env, args []string) int {
 		return cmdShow(ctx, e, args[1:])
 	case "author":
 		return cmdAuthor(ctx, e, args[1:])
+	case "new":
+		return cmdNew(ctx, e, args[1:])
+	case "promote":
+		return cmdPromote(ctx, e, args[1:])
 	case "diff":
 		return cmdDiff(ctx, e, args[1:])
 	case "ack":

@@ -18,6 +18,8 @@ type lsEntry struct {
 	Active bool     `json:"active"`
 	Keys   []string `json:"keys"`
 	Files  []string `json:"files"`
+	// Dir is where a local or worktree profile's files are.
+	Dir string `json:"dir,omitempty"`
 }
 
 // cmdLs lists the profiles across the three tiers.
@@ -41,7 +43,7 @@ func cmdLs(ctx context.Context, e Env, args []string) int {
 	entries := []lsEntry{{Name: config.Base, Tier: "builtin", Active: l.Result.Profile.Name == config.Base || l.Profile == nil, Keys: []string{}, Files: []string{}}}
 	var inactiveWarnings []config.Warning
 	for _, p := range listing.Profiles {
-		ent := lsEntry{Name: p.Name, Tier: string(p.Tier), Active: p.Name == l.Result.Profile.Name, Keys: []string{}, Files: []string{}}
+		ent := lsEntry{Name: p.Name, Tier: string(p.Tier), Active: p.Name == l.Result.Profile.Name, Keys: []string{}, Files: []string{}, Dir: personalDir(p)}
 		var cfg *config.File
 		if p.Tier == profiles.Committed && !profiles.RealDir(p.Dir) {
 			// Hidden from disk (inactive): read it as committed at HEAD.
@@ -67,14 +69,28 @@ func cmdLs(ctx context.Context, e Env, args []string) int {
 		}
 		entries = append(entries, ent)
 	}
+	shadowed := []lsEntry{}
+	for _, p := range listing.Shadowed {
+		ent := lsEntry{Name: p.Name, Tier: string(p.Tier), Keys: []string{}, Files: nonNilStrings(profiles.Files(p)), Dir: personalDir(p)}
+		if cfg, _ := profiles.ReadConfig(p); cfg != nil {
+			for k, v := range cfg.Keys {
+				ent.Keys = append(ent.Keys, k+"="+v)
+			}
+			sort.Strings(ent.Keys)
+		}
+		shadowed = append(shadowed, ent)
+	}
 	warnings := append(append(listing.Warnings, l.Result.Warnings...), inactiveWarnings...)
 
 	if *asJSON {
 		out, _ := json.Marshal(struct {
-			Active   string           `json:"active"`
-			Profiles []lsEntry        `json:"profiles"`
+			Active   string    `json:"active"`
+			Profiles []lsEntry `json:"profiles"`
+			// Shadowed are personal profiles a committed one of the same name hides
+			// (`outfit show <tier>:<name>`, `outfit new <other> --from <tier>:<name>`).
+			Shadowed []lsEntry        `json:"shadowed"`
 			Warnings []config.Warning `json:"warnings"`
-		}{l.Result.Profile.Name, entries, nonNil(warnings)})
+		}{l.Result.Profile.Name, entries, shadowed, nonNil(warnings)})
 		fmt.Fprintln(e.Stdout, string(out))
 		return ExitOK
 	}

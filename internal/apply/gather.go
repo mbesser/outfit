@@ -119,7 +119,7 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 	if in.Profile != nil {
 		seen := map[string]bool{}
 		for _, f := range in.Files {
-			if IsJunk(pathpkg.Base(f)) {
+			if profiles.IsJunk(pathpkg.Base(f)) {
 				continue // Finder, editor and merge leftovers are not profile files
 			}
 			if err := plan.ValidSwapPath(f); err != nil {
@@ -314,21 +314,6 @@ func (in Input) gather(ctx context.Context, st *state.State) (plan.Want, plan.Fa
 	facts.SparseText = sparseNow(in.W.GitDir)
 	facts.ExcludeHas = excludeHas(filepath.Join(in.W.CommonDir, "info", "exclude"))
 	return want, facts, g, nil
-}
-
-// IsJunk reports a file the operating system or an editor leaves in a directory: never
-// a profile file, and never worth a note on every sync.
-func IsJunk(n string) bool {
-	switch n {
-	case ".DS_Store", "Thumbs.db", "desktop.ini":
-		return true
-	}
-	for _, suf := range []string{"~", ".swp", ".swo", ".swx", ".tmp", ".orig", ".rej", ".bak"} {
-		if strings.HasSuffix(n, suf) {
-			return true
-		}
-	}
-	return strings.HasPrefix(n, ".#") || (len(n) > 2 && strings.HasPrefix(n, "#") && strings.HasSuffix(n, "#"))
 }
 
 // sameCommit reports whether the latest commit that touched base also touched variant.

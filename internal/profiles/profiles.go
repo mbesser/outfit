@@ -71,19 +71,29 @@ type Profile struct {
 
 // TierDir returns the directory that holds a tier's profiles.
 func TierDir(r repo.Repo, t Tier) string {
+	return TierDirIn(r.WorkTree, r.CommonDir, r.GitDir, t)
+}
+
+// TierDirIn is TierDir for any worktree (its path, the common dir, its git dir): the one
+// place that knows where each tier lives, for code that looks at OTHER worktrees.
+func TierDirIn(workTree, commonDir, gitDir string, t Tier) string {
 	switch t {
 	case Committed:
-		return filepath.Join(r.WorkTree, filepath.FromSlash(CommittedRoot))
+		return filepath.Join(workTree, filepath.FromSlash(CommittedRoot))
 	case Local:
-		return filepath.Join(r.CommonDir, "outfit", "profiles")
+		return filepath.Join(commonDir, "outfit", "profiles")
 	default:
-		return filepath.Join(r.GitDir, "outfit", "worktree-profiles")
+		return filepath.Join(gitDir, "outfit", "worktree-profiles")
 	}
 }
 
 // Listing is the result of List.
 type Listing struct {
 	Profiles []Profile
+	// Shadowed are the profiles a committed (or earlier-tier) profile of the same name
+	// hides. They are not usable by name, but `outfit new <other> --from tier:name`
+	// can still copy them, which is the fix the clash warning prints.
+	Shadowed []Profile
 	Warnings []config.Warning
 }
 
@@ -109,9 +119,10 @@ func List(ctx context.Context, g gitx.Client, r repo.Repo) Listing {
 	seen := map[string]Profile{}
 	add := func(p Profile) {
 		if prev, ok := seen[p.Name]; ok {
+			l.Shadowed = append(l.Shadowed, p)
 			l.Warnings = append(l.Warnings, config.Warning{
 				Source:  string(p.Tier) + " profile " + p.Name,
-				Message: fmt.Sprintf("name clashes with the %s profile %q, which wins; rename your directory %s to a free name", prev.Tier, p.Name, p.Dir),
+				Message: fmt.Sprintf("name clashes with the %s profile %q, which wins; keep yours under another name: outfit new <other-name> --from %s:%s   (then delete %s)", prev.Tier, p.Name, p.Tier, p.Name, p.Dir),
 			})
 			return
 		}
@@ -136,7 +147,10 @@ func List(ctx context.Context, g gitx.Client, r repo.Repo) Listing {
 		add(Profile{Name: n, Tier: Committed, Dir: filepath.Join(TierDir(r, Committed), n)})
 	}
 	for _, t := range []Tier{Local, Worktree} {
-		names, _ := dirNames(TierDir(r, t))
+		names, bad := dirNames(TierDir(r, t))
+		for _, b := range bad {
+			l.Warnings = append(l.Warnings, config.Warning{Source: filepath.Join(TierDir(r, t), esc(b)), Message: "not a valid profile name (lowercase letters, digits, dots, dashes, underscores): ignored; `outfit uninstall --purge` removes it"})
+		}
 		for _, n := range sortedKeys(names) {
 			add(Profile{Name: n, Tier: t, Dir: filepath.Join(TierDir(r, t), n)})
 		}
@@ -169,7 +183,9 @@ func Locate(r repo.Repo, name string) (Profile, bool) {
 // inactive profile is hidden; so is the active one in the moment between
 // `git config outfit.profile <name>` and the sync that brings it back). It returns
 // the profile and its profile.config as committed. It costs git calls, so it is
-// only for that rare mismatch, never the hot path.
+// for that rare mismatch, and for one check on the hot path: a personal profile is
+// active in a repository that has committed ones (a committed profile of the same name
+// wins even while it is hidden from disk), which `load` asks with one ls-tree.
 func LocateHead(ctx context.Context, g gitx.Client, r repo.Repo, name string) (Profile, *config.File, bool) {
 	if ValidName(name) != nil {
 		return Profile{}, nil, false
