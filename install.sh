@@ -6,7 +6,7 @@
 #     https://raw.githubusercontent.com/prosperity-solutions/outfit/main/install.sh | sh
 #
 # While the repository is private the download needs a GitHub token that can read
-# it. The script finds one the way `outfit update` will: OUTFIT_GITHUB_TOKEN,
+# it. The script finds one the way `outfit update` does: OUTFIT_GITHUB_TOKEN,
 # GH_TOKEN, GITHUB_TOKEN, then `gh auth token`. With none, it uses the public
 # release URLs, which work once the repository is public.
 #
@@ -19,7 +19,7 @@
 #   OUTFIT_BASE_URL       Public download base (default https://github.com/prosperity-solutions/outfit).
 #                         For tests.
 #   OUTFIT_API_URL        API base (default https://api.github.com/repos/prosperity-solutions/outfit).
-#                         For tests.
+#                         For tests; the token is sent only to api.github.com or this machine.
 #   OUTFIT_MINISIGN_PUBKEY  Replaces the embedded signing key(s) below. For tests.
 #
 # A release always carries checksums.txt and checksums.txt.minisig; both are
@@ -135,13 +135,17 @@ verify_signature() {
   err "the signature on checksums.txt does not match the outfit release key; nothing was installed"
 }
 
-# Only these files, as plain files, with plain names.
+# Only these files, as plain files, with plain names. The same list is in
+# .goreleaser.yaml (tests/validate-install-contract.sh). `outfit update` is more
+# lenient on purpose (internal/update/archive.go): this script is fetched fresh every
+# time and may be strict; an installed outfit is frozen and must not refuse a newer
+# archive because it holds one more plain file.
 check_archive() {
   tar -tzf "$1" >"$tmp/entries.txt" || err "$2 is not a readable tar.gz"
   while IFS= read -r entry; do
     case "$entry" in
       outfit | LICENSE | README.md | NOTICE) ;;
-      *) err "unexpected entry '$entry' in $2; nothing was installed" ;;
+      *) err "unexpected entry '$entry' in $2; nothing was installed (is .goreleaser.yaml's archive layout in step with install.sh?)" ;;
     esac
   done <"$tmp/entries.txt"
   grep -qx outfit "$tmp/entries.txt" || err "$2 has no outfit binary"
@@ -194,8 +198,9 @@ main() {
   if [ -n "$token" ]; then
     # The token goes to the API URL and nowhere else, and never in the clear.
     case "$api" in
-      https://* | file://* | http://localhost[:/]* | http://127.0.0.1[:/]*) ;;
-      *) err "refusing to send a GitHub token to $api (only https URLs; OUTFIT_API_URL is for tests)" ;;
+      *@*) err "refusing to send a GitHub token to $api (a URL with a user part can name another host)" ;;
+      https://api.github.com/* | file://* | http://localhost[:/]* | http://127.0.0.1[:/]*) ;;
+      *) err "refusing to send a GitHub token to $api (it goes only to https://api.github.com; OUTFIT_API_URL is for tests and may only name this machine)" ;;
     esac
     rel=latest
     [ -z "$ver" ] || rel=tags/v$ver
