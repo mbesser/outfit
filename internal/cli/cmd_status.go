@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/prosperity-solutions/outfit/internal/apply"
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
 	"github.com/prosperity-solutions/outfit/internal/hooks"
@@ -34,10 +35,13 @@ type statusJSON struct {
 	Tier    string          `json:"tier"`
 	Toggles []config.Toggle `json:"toggles"`
 	// Dispatcher is the state of the hook dispatcher.
-	Dispatcher dispatcherInfo   `json:"dispatcher"`
-	Locked     []string         `json:"locked"`
-	Files      []statusFile     `json:"files"`
-	Warnings   []config.Warning `json:"warnings"`
+	Dispatcher dispatcherInfo `json:"dispatcher"`
+	Locked     []string       `json:"locked"`
+	Files      []statusFile   `json:"files"`
+	// Sync says whether the worktree matches the active profile (only when outfit
+	// is installed here).
+	Sync     *syncJSON        `json:"sync,omitempty"`
+	Warnings []config.Warning `json:"warnings"`
 }
 
 // cmdStatus shows the active profile and where every value comes from. It is
@@ -81,7 +85,18 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 	}
 	if l.Profile != nil {
 		st.Tier = string(l.Profile.Tier)
-		for _, f := range profiles.Files(*l.Profile) {
+		files := profiles.Files(*l.Profile)
+		// Where outfit has synced this profile, list the swaps that really happened: a
+		// path it skipped (not tracked, no file in the profile, an executable-bit
+		// mismatch) is not one. Before the first sync, the profile's own files.
+		if rec, err := state.Read(l.Repo.GitDir); err == nil && rec.Profile == l.Profile.Name {
+			files = files[:0:0]
+			for _, s := range rec.Swaps {
+				files = append(files, s.Path)
+			}
+			sort.Strings(files)
+		}
+		for _, f := range files {
 			st.Files = append(st.Files, statusFile{Path: f, Profile: l.Profile.Name, Tier: st.Tier})
 		}
 	}
@@ -91,11 +106,31 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 		outOfSync = true
 		st.Warnings = append(st.Warnings, config.Warning{Source: "hook dispatcher", Message: st.Dispatcher.Problem + ": your team's hooks are NOT running. Fix: outfit init"})
 	}
+	if w := untrackedProfileWarning(ctx, l); w != "" {
+		st.Warnings = append(st.Warnings, config.Warning{Source: "profile", Message: w})
+	}
 	// A clash between a personal and a committed profile name is worth saying.
 	st.Warnings = append(st.Warnings, profiles.List(ctx, l.Git, l.Repo).Warnings...)
 
 	exit := ExitOK
-	if outOfSync {
+	var syncRes *apply.Result
+	if st.Dispatcher.Installed {
+		if sr, serr := apply.Check(ctx, syncInput(ctx, e, l, true)); serr != nil {
+			st.Warnings = append(st.Warnings, config.Warning{Source: "sync", Message: "cannot tell whether the files are in sync: " + serr.Error()})
+		} else {
+			syncRes = sr
+			j := toJSON(sr)
+			j.Changed = false
+			st.Sync = &j
+			switch {
+			case sr.NeedsHuman || len(sr.Refused) > 0:
+				exit = ExitNeedsHuman
+			case sr.Pending():
+				outOfSync = true
+			}
+		}
+	}
+	if outOfSync && exit == ExitOK {
 		exit = ExitOutOfSync
 	}
 	if *asJSON {
@@ -160,6 +195,25 @@ func cmdStatus(ctx context.Context, e Env, args []string) int {
 			fmt.Fprintln(w, "hooks    dispatcher installed")
 		} else {
 			fmt.Fprintf(w, "hooks    dispatcher BROKEN: %s\n", st.Dispatcher.Problem)
+		}
+	}
+	if syncRes != nil {
+		switch {
+		case syncRes.NeedsHuman || len(syncRes.Refused) > 0:
+			fmt.Fprintln(w, "state    NEEDS A PERSON (see below)")
+		case syncRes.Pending():
+			fmt.Fprintln(w, "state    out of sync: run outfit sync")
+		default:
+			fmt.Fprintln(w, "state    in sync")
+		}
+		for _, n := range syncRes.Notes {
+			fmt.Fprintf(e.Stderr, "note: %s\n", n)
+		}
+		for _, a := range syncRes.Refused {
+			fmt.Fprintf(e.Stderr, "note: %s\n", a.Reason)
+			if a.Fix != "" {
+				fmt.Fprintf(e.Stderr, "  fix: %s\n", a.Fix)
+			}
 		}
 	}
 	for _, wn := range st.Warnings {

@@ -297,7 +297,9 @@ func Install(ctx context.Context, g gitx.Client, r repo.Repo, gc config.GitConfi
 		}
 		st := &state.State{GitVersion: opt.GitVersion}
 		if prev, err := state.Read(w.GitDir); err == nil {
-			st.Swaps = prev.Swaps
+			// Keep everything sync recorded; init only refreshes the git version.
+			*st = *prev
+			st.GitVersion = opt.GitVersion
 		}
 		if opt.DryRun {
 			if prev, err := state.Read(w.GitDir); err != nil || prev.GitVersion != st.GitVersion {
@@ -495,6 +497,8 @@ func Uninstall(ctx context.Context, g gitx.Client, r repo.Repo, gc config.GitCon
 
 	// 5. State files and the install record.
 	for _, w := range wts {
+		// The sync lock is an flock file that is never removed while outfit runs.
+		_ = os.Remove(filepath.Join(filepath.Dir(state.Path(w.GitDir)), "sync.lock"))
 		if err := os.Remove(state.Path(w.GitDir)); err == nil {
 			note("state " + state.Path(w.GitDir))
 			_ = os.Remove(filepath.Dir(state.Path(w.GitDir)))

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
+	"github.com/prosperity-solutions/outfit/internal/apply"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
 	"github.com/prosperity-solutions/outfit/internal/hooks"
 )
@@ -42,10 +44,44 @@ func cmdInit(ctx context.Context, e Env, args []string) int {
 	if err != nil {
 		return fail(Errorf("%v", err))
 	}
+	// Profile files: with committed profiles the inactive ones are hidden from disk
+	// from the first moment, and .git/info/exclude keeps search tools out of
+	// .outfit. A sparse checkout that is not ours is refused, not fatal: the
+	// dispatcher is installed either way.
+	var syncRes *apply.Result
+	var syncErr error
+	if !*dry {
+		if l2, lerr := load(ctx, e); lerr != nil {
+			syncErr = lerr
+		} else {
+			syncRes, _, syncErr = converge(ctx, e, l2, true)
+		}
+	}
 	if *asJSON {
-		out, _ := json.Marshal(res)
-		fmt.Fprintln(e.Stdout, string(out))
-		return ExitOK
+		out := struct {
+			*hooks.InstallResult
+			Sync      *syncJSON `json:"sync,omitempty"`
+			SyncError string    `json:"sync_error,omitempty"`
+			Fix       string    `json:"fix,omitempty"`
+		}{InstallResult: res}
+		if syncRes != nil {
+			j := toJSON(syncRes)
+			out.Sync = &j
+		}
+		if syncErr != nil {
+			out.SyncError = syncErr.Error()
+			out.Fix = "outfit sync"
+		} else if syncRes != nil && (syncRes.NeedsHuman || len(syncRes.Refused) > 0) {
+			out.Fix = "outfit status"
+		}
+		b, _ := json.Marshal(out)
+		fmt.Fprintln(e.Stdout, string(b))
+		return initExit(syncRes, syncErr)
+	}
+	if syncErr != nil {
+		fmt.Fprintf(e.Stderr, "outfit: profile files were not set up: %v\n  fix: outfit sync\n", syncErr)
+	} else if syncRes != nil {
+		printNotes(e, syncRes)
 	}
 	verb := map[bool]string{true: "would install", false: "installed"}[*dry]
 	switch {
@@ -71,6 +107,17 @@ func cmdInit(ctx context.Context, e Env, args []string) int {
 			fmt.Fprintf(e.Stdout, "  worktrees whose directory is gone (configured anyway; `git worktree prune` removes them): %s\n", strings.Join(res.MissingWorktrees, ", "))
 		}
 	}
+	return initExit(syncRes, syncErr)
+}
+
+// initExit is 0 when the dispatcher is in and the profile files are in order, and
+// 3 when the dispatcher is installed but a person has to look at the profile files
+// (a sparse checkout that is not ours, a refusal, an error): init's own job is done
+// either way, and rerunning it is harmless.
+func initExit(syncRes *apply.Result, syncErr error) int {
+	if syncErr != nil || (syncRes != nil && syncExit(syncRes) != ExitOK) {
+		return ExitNeedsHuman
+	}
 	return ExitOK
 }
 
@@ -90,10 +137,28 @@ func cmdUninstall(ctx context.Context, e Env, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	// Links go and base files come back BEFORE anything else is undone: sparse
+	// checkout must still be on while they do, and disabled only after.
+	var undone, undoFailed []string
+	for _, w := range hooks.Worktrees(l.Repo.CommonDir) {
+		did, failed := apply.Teardown(ctx, apply.Workspace{WorkTree: w.Path, GitDir: w.GitDir, CommonDir: l.Repo.CommonDir})
+		undone = append(undone, did...)
+		undoFailed = append(undoFailed, failed...)
+	}
+	if removed, err := apply.RemoveExclude(filepath.Join(l.Repo.CommonDir, "info", "exclude")); err != nil {
+		undoFailed = append(undoFailed, "info/exclude: "+err.Error())
+	} else if removed {
+		undone = append(undone, ".git/info/exclude entry")
+	}
 	res, err := hooks.Uninstall(ctx, l.Git, l.Repo, l.Cfg, e.Getenv("HOME"))
 	if err != nil {
 		return fail(Errorf("%v", err))
 	}
+	if len(undone) > 0 {
+		res.Changed = true
+		res.Removed = append(res.Removed, undone...)
+	}
+	res.Failed = append(res.Failed, undoFailed...)
 	if *asJSON {
 		out, _ := json.Marshal(res)
 		fmt.Fprintln(e.Stdout, string(out))
