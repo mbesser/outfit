@@ -46,15 +46,26 @@ With no token the script uses the public `releases/latest/download/…` URLs.
 3. Checks the archive's SHA-256 against `checksums.txt`. A mismatch stops everything.
    This catches a damaged download. It does **not** catch a tampered release, because
    `checksums.txt` comes from the same place as the archive.
-4. If `minisign` is installed, checks the signature of `checksums.txt` against the
-   release key built into the script (the same key `outfit update` uses, kept in
+4. Checks the signature of `checksums.txt` against the release key built into the
+   script (the same key `outfit update` uses, kept in
    [`internal/update/keys.txt`](../internal/update/keys.txt)). A bad signature stops
-   everything. This is the check that catches tampering, so **install `minisign`
-   first if you can** (`brew install minisign`, `apt install minisign`). Without it
-   the script says it only checked the checksum. With a token, it also requires the
-   archive to be the build the release is named for, so an old, validly signed build
-   cannot be re-uploaded under a newer release; the public URL path cannot check
-   that, because GitHub's "latest" redirect is not signed.
+   everything. This is the check that catches tampering. You do not need `minisign`
+   for it: with a working one on your PATH the script uses it, and without one it downloads
+   minisign's own static build from
+   [jedisct1/minisign](https://github.com/jedisct1/minisign/releases) (Linux amd64 and
+   arm64, macOS arm64 and Intel), and runs it **only if its SHA-256 equals the one
+   written in the script**. That download is sent no token and is not installed
+   anywhere: it lives in the temporary folder and goes with it. It is run once to prove it
+   works here. If it cannot be fetched or run (offline, a proxy, a folder you cannot
+   run programs from), the script stops, says what failed (for a folder you cannot run
+   programs from, `TMPDIR` can point elsewhere), and says what to do: install minisign, or run again with `OUTFIT_SKIP_SIGNATURE=1` to accept a
+   SHA-256 check only (it prints a warning). Put the variable on the `sh` side of the
+   pipe: `curl -fsSL … | OUTFIT_SKIP_SIGNATURE=1 sh`. If the download is there but does
+   not match the pinned hash, the script does not suggest skipping anything.
+   With a token, the script also requires the archive to be the build the release is
+   named for, so an old, validly signed build cannot be re-uploaded under a newer
+   release; the public URL path cannot check that, because GitHub's "latest" redirect
+   is not signed.
 5. Looks inside the archive and accepts only `outfit`, `LICENSE`, `README.md` and
    `NOTICE`, as plain files.
 6. Puts `outfit` next to the existing one (the folder `command -v outfit` finds), or
@@ -75,7 +86,10 @@ With no token the script uses the public `releases/latest/download/…` URLs.
 | `OUTFIT_GITHUB_TOKEN` | A GitHub token with read access to the repository. |
 | `OUTFIT_BASE_URL` | Public download base. For tests. |
 | `OUTFIT_API_URL` | API base. For tests. |
+| `OUTFIT_SKIP_SIGNATURE` | `1` installs with the SHA-256 check only, when no signature checker can be had (no `minisign` on PATH and the pinned download failed). It never skips a check that can run. Prints a warning. |
 | `OUTFIT_MINISIGN_PUBKEY` | Replaces the built-in signing key(s). For tests. |
+| `OUTFIT_BOOTSTRAP_URL` | Replaces the download of the signature checker. For tests. |
+| `OUTFIT_BOOTSTRAP_SHA256` | Its SHA-256, which must go with `OUTFIT_BOOTSTRAP_URL`. For tests. |
 
 `tests/validate-install-contract.sh` fails CI if this table and the script's header
 ever disagree.
