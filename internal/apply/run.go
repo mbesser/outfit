@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -194,7 +195,7 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 				if !realParents(in.W.WorkTree, a.Path) {
 					return fmt.Errorf("%s is below a symlinked directory: refusing to act through it", a.Path)
 				}
-				if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if fi, err := os.Lstat(p); err == nil && (fi.Mode()&os.ModeSymlink != 0 || (fi.Mode().IsRegular() && ourHardOrSameText(p, a.Target, ""))) {
 					if err := os.Remove(p); err != nil {
 						return err
 					}
@@ -238,7 +239,7 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 				}
 				res.Changed = true
 			case plan.LinkPath:
-				if err := in.link(a.Path, a.Target, a.Replaces); err != nil {
+				if err := in.link(a.Path, a.Target, a.Replaces, !a.Extra); err != nil {
 					return err
 				}
 				res.Changed = true
@@ -319,7 +320,13 @@ func (in Input) execute(ctx context.Context, st *state.State, acts []plan.Action
 					}
 				}
 			}
-			next.Swaps = append(next.Swaps, state.Swap{Path: sw.Path, Target: sw.Target, VariantHash: pf.VariantHash, VariantBlob: pf.VariantBlob, BaseBlob: base, SeenBase: g.blobs[sw.Path], KnownBases: known})
+			swap := state.Swap{Path: sw.Path, Target: sw.Target, VariantHash: pf.VariantHash, VariantBlob: pf.VariantBlob, BaseBlob: base, SeenBase: g.blobs[sw.Path], KnownBases: known}
+			if pf.Hard {
+				if fi, err := os.Lstat(in.abs(sw.Path)); err == nil {
+					swap.Dev, swap.Inode = fileID(fi)
+				}
+			}
+			next.Swaps = append(next.Swaps, swap)
 		}
 	}
 	sort.Slice(next.Swaps, func(i, j int) bool { return next.Swaps[i].Path < next.Swaps[j].Path })
@@ -504,7 +511,7 @@ func tmpLinkPath(path string) string {
 // made under a temporary name and renamed over the target so there is never a
 // moment with neither a file nor a link. An existing regular file is removed only
 // when the plan proved it an untouched copy of the committed file.
-func (in Input) link(path, target string, replaces bool) error {
+func (in Input) link(path, target string, replaces, hard bool) error {
 	if !realParents(in.W.WorkTree, path) {
 		return fmt.Errorf("%s is below a symlinked directory: refusing to link through it", path)
 	}
@@ -518,6 +525,20 @@ func (in Input) link(path, target string, replaces bool) error {
 		case fi.Mode().IsRegular() && replaces:
 		default:
 			return fmt.Errorf("%s exists and is not outfit's to replace", path)
+		}
+	}
+	// A local or worktree profile is hard-linked (hardlink.go): the file then lives inside the worktree
+	// for every agent. A file system that cannot do it gets the symlink below.
+	if hard && in.hardAllowed() && filepath.IsAbs(target) {
+		err := in.linkHard(abs, path, target)
+		if err == nil {
+			return nil
+		}
+		if !canFallBack(err) {
+			return err
+		}
+		if !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.EMLINK) {
+			_ = os.WriteFile(in.noHardMarker(), []byte("a hard link failed here ("+err.Error()+"): symlinks are used in this worktree\n"), 0o600)
 		}
 	}
 	// The link is made in outfit's own directory inside the git dir and renamed into place
@@ -558,11 +579,15 @@ func (in Input) absorb(path, target string) error {
 	if vi, err := os.Lstat(in.variantPath(path)); err == nil {
 		mode = vi.Mode().Perm()
 	}
-	if err := state.WriteFileAtomic(in.variantPath(path), b, mode); err != nil {
-		return fmt.Errorf("cannot save %s into the profile: %w", path, err)
+	// (When the profile already holds these bytes nothing is written: a write would give the profile's file
+	// a new inode and leave every other worktree's hard link behind, forever re-absorbing.)
+	if vb, verr := os.ReadFile(in.variantPath(path)); verr != nil || !bytes.Equal(vb, b) {
+		if err := state.WriteFileAtomic(in.variantPath(path), b, mode); err != nil {
+			return fmt.Errorf("cannot save %s into the profile: %w", path, err)
+		}
 	}
 	fault.Point("absorbed into the profile, not yet relinked")
-	return in.link(path, target, true)
+	return in.link(path, target, true, true)
 }
 
 // quarantine saves copies under <git-dir>/outfit/quarantine/<timestamp>-<key>/ : the

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/prosperity-solutions/outfit/internal/config"
 	"github.com/prosperity-solutions/outfit/internal/gitx"
@@ -56,9 +57,17 @@ func Guard(ctx context.Context, g gitx.Client, gitDir string, gc config.GitConfi
 	}
 	sparseText, _ := os.ReadFile(filepath.Join(gitDir, "info", "sparse-checkout"))
 	swapped := map[string]bool{}
+	profileFile := map[string]string{} // swapped path -> the profile's file (absolute), for a local or worktree profile
+	linked := map[string][2]uint64{}   // swapped path -> the disk and inode of the hard link outfit made there
 	if st != nil {
 		for _, s := range st.Swaps {
 			swapped[s.Path] = true
+			if filepath.IsAbs(s.Target) {
+				profileFile[s.Path] = s.Target
+				if s.Inode != 0 {
+					linked[s.Path] = [2]uint64{s.Dev, s.Inode}
+				}
+			}
 		}
 	}
 	for _, p := range hiddenPaths(string(sparseText)) {
@@ -86,7 +95,7 @@ func Guard(ctx context.Context, g gitx.Client, gitDir string, gc config.GitConfi
 	var out []Violation
 	sparseViolation := checkSparse(swapped, replaced, gitDir, gc)
 
-	res, err := g.Read(ctx, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-ext-diff")
+	res, err := g.Read(ctx, "diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames", "--no-ext-diff")
 	if err != nil {
 		return append(out, Violation{Message: "outfit could not read the index to check swapped files: " + err.Error(), Fix: "git status"}), nil
 	}
@@ -96,9 +105,9 @@ func Guard(ctx context.Context, g gitx.Client, gitDir string, gc config.GitConfi
 		// git 2.36 moves our link aside to `<path>~cruft` when a merge conflicts on a swapped
 		// path, and `merge --abort` runs no hook to put things right: `git add -A` would stage
 		// that symlink. (Found by the property test.)
-		if base, ok := strings.CutSuffix(e.path, "~cruft"); ok && swapped[base] && e.newMode == "120000" {
+		if base, ok := strings.CutSuffix(e.path, "~cruft"); ok && swapped[base] && e.newMode != "000000" {
 			out = append(out, Violation{Path: e.path,
-				Message: fmt.Sprintf("%s is outfit's own link for %s, moved aside by git during a merge: committing it would put a link into history", e.path, base),
+				Message: fmt.Sprintf("%s is outfit's own link for %s (a symlink, or a hard link of the profile's file), moved aside by git during a merge: committing it would put a link, or your profile's text, into history", e.path, base),
 				Fix:     fmt.Sprintf("git reset -q -- %s && rm -f %s && outfit sync", shArg(e.path), shArg(e.path))})
 			continue
 		}
@@ -109,7 +118,7 @@ func Guard(ctx context.Context, g gitx.Client, gitDir string, gc config.GitConfi
 					Message: fmt.Sprintf("%s is staged as a symlink (mode 120000) below %s, which your active profile replaces: committing it would put outfit's link into history", e.path, d),
 					Fix:     fmt.Sprintf("git reset -q -- %s && outfit sync", shArg(e.path))})
 			case allow:
-			case merging && (e.newMode == "100644" || e.newMode == "100755" || e.newMode == "000000"):
+			case merging && (e.newMode == "100644" || e.newMode == "100755" || e.newMode == "000000") && !stagesProfileText(ctx, g, profileFile[e.path], linked[e.path], e):
 			default:
 				out = append(out, Violation{Path: e.path,
 					Message: fmt.Sprintf("%s is below %s, which your active profile replaces: what is staged there is not what your checkout shows, and must not be committed from it", e.path, d),
@@ -126,7 +135,7 @@ func Guard(ctx context.Context, g gitx.Client, gitDir string, gc config.GitConfi
 				Message: fmt.Sprintf("%s is staged as a symlink (mode 120000): committing it would put outfit's link into history", e.path),
 				Fix:     fmt.Sprintf("git reset -q -- %s && outfit sync", shArg(e.path))})
 		case allow:
-		case merging && (e.newMode == "100644" || e.newMode == "100755" || e.newMode == "000000"):
+		case merging && (e.newMode == "100644" || e.newMode == "100755" || e.newMode == "000000") && !stagesProfileText(ctx, g, profileFile[e.path], linked[e.path], e):
 		default:
 			out = append(out, Violation{Path: e.path,
 				Message: fmt.Sprintf("%s is swapped by your active profile and must not be committed from this checkout", e.path),
@@ -242,6 +251,7 @@ func checkSparse(swapped map[string]bool, replaced []string, gitDir string, gc c
 
 type rawEntry struct {
 	oldMode, newMode string
+	newBlob          string
 	status           string
 	path             string
 }
@@ -256,9 +266,41 @@ func parseRaw(b []byte) []rawEntry {
 		if len(f) < 5 {
 			continue
 		}
-		out = append(out, rawEntry{oldMode: f[0], newMode: f[1], status: f[4], path: string(parts[i+1])})
+		out = append(out, rawEntry{oldMode: f[0], newMode: f[1], newBlob: f[3], status: f[4], path: string(parts[i+1])})
 	}
 	return out
+}
+
+// stagesProfileText reports that the blob staged for e is the private text of a local or worktree profile:
+// the profile's file now (profile is its absolute path, "" for a committed profile), or what this worktree's
+// file still holds when it is the hard link outfit made (id is its disk and inode) although the profile has
+// moved on to a new file since. Resolving a merge conflict legitimately stages the team's file, never that.
+// The blob is made the way git makes it for the swapped path (--path: .gitattributes, filters).
+func stagesProfileText(ctx context.Context, g gitx.Client, profile string, id [2]uint64, e rawEntry) bool {
+	if profile == "" || e.newMode == "000000" {
+		return false
+	}
+	blobOf := func(file string) bool {
+		res, err := g.Read(ctx, "hash-object", "--path="+e.path, "--", file)
+		return err == nil && strings.TrimSpace(string(res.Stdout)) == e.newBlob
+	}
+	if blobOf(profile) {
+		return true
+	}
+	if id[1] == 0 {
+		return false
+	}
+	top, err := g.Read(ctx, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false
+	}
+	file := filepath.Join(strings.TrimSpace(string(top.Stdout)), filepath.FromSlash(e.path))
+	if fi, err := os.Lstat(file); err == nil && fi.Mode().IsRegular() {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Dev) == id[0] && uint64(st.Ino) == id[1] { //nolint:unconvert // platform types
+			return blobOf(file)
+		}
+	}
+	return false
 }
 
 func exists(p string) bool { _, err := os.Lstat(p); return err == nil }
