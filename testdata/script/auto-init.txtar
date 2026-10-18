@@ -1,0 +1,110 @@
+# `outfit use` and `outfit author on|off` install outfit themselves when it was never installed here (the
+# only thing they could do otherwise is refuse and ask for `outfit init`); sync, diff and ack do not, and say so.
+fixture repo team
+cd repo
+
+# nothing is installed: the read-only and the settings commands work, and say what they need
+outfit status
+outfit set hook.pre-commit=off
+stderr 'outfit init'
+outfit sync
+stdout 'nothing to sync'
+outfit sync --json
+stdout '"changed": *false'
+stdout 'nothing to sync'
+! outfit diff AGENTS.md
+stderr 'nothing is swapped in this repository yet'
+stderr 'fix: outfit use <profile>'
+! outfit ack AGENTS.md
+stderr 'nothing is swapped'
+# bare `author` only reads
+! outfit author
+stderr 'not installed'
+
+# use installs, says so once, and swaps
+outfit use yolo
+stderr 'ran `outfit init` for you'
+exec git config --worktree --get core.hooksPath
+stdout 'outfit'
+exists .git/outfit/install.json
+exec git status --short
+! stdout .
+exec cat AGENTS.md
+stdout 'yolo'
+# the second time there is nothing to say
+outfit use base
+! stderr 'ran `outfit init`'
+outfit use yolo --json
+stdout '"profile":"yolo"'
+! stdout 'auto_init'
+outfit uninstall
+! exec git config --worktree --get core.hooksPath
+
+# --json says it in the output instead
+outfit use yolo --json
+stdout '"auto_init":true'
+! stderr 'ran `outfit init`'
+outfit uninstall
+
+# author on|off installs too
+outfit author on
+stderr 'ran `outfit init` for you'
+outfit author --json
+stdout '"author":true'
+outfit uninstall
+outfit author on --json
+stdout '"auto_init":true'
+outfit uninstall
+
+# a typo installs nothing: the arguments are checked first
+! outfit use nosuchprofile
+stderr 'no profile called'
+! exists .git/outfit/install.json
+! outfit use Bad_Name
+! exists .git/outfit/install.json
+! outfit author on nosuchprofile
+stderr 'is not a committed profile'
+! exists .git/outfit/install.json
+! exec git config --worktree --get core.hooksPath
+
+# two commands at once on a fresh repository (agents in parallel): one installs, the other waits for it and
+# finds it installed; neither trips over git's config lock
+exec sh -c 'outfit use yolo > $WORK/a.txt 2>&1 & outfit use lean > $WORK/b.txt 2>&1 & wait'
+! grep 'could not lock' $WORK/a.txt
+! grep 'could not lock' $WORK/b.txt
+! grep 'File exists' $WORK/a.txt
+! grep 'File exists' $WORK/b.txt
+exists .git/outfit/install.json
+outfit uninstall
+
+# OUTFIT_NO_AUTO_INIT=1 is the strict refusal, and changes nothing
+env OUTFIT_NO_AUTO_INIT=1
+! outfit use yolo
+stderr 'not installed'
+stderr 'fix: outfit init'
+! outfit author on
+stderr 'fix: outfit init'
+! exists .git/outfit/install.json
+exec cat AGENTS.md
+! stdout 'yolo'
+env OUTFIT_NO_AUTO_INIT=
+
+# when init itself refuses (another tool owns core.hooksPath for this worktree) the command fails with that
+# message and changes nothing
+exec git config extensions.worktreeConfig true
+exec git config --worktree core.hooksPath /somewhere/else
+! outfit use yolo
+stderr 'core.hooksPath is already set'
+! exists .git/outfit/install.json
+exec cat AGENTS.md
+! stdout 'yolo'
+
+# an install record that cannot be used (written by a newer outfit) is not "never installed": sync, diff, ack
+# and use say so, and nothing pretends to be in sync
+exec git config --worktree --unset core.hooksPath
+outfit use yolo
+exec sh -c 'printf "{\"schema\": 99}\n" > .git/outfit/install.json'
+! outfit sync
+! stdout 'nothing to sync'
+! outfit diff AGENTS.md
+! stderr 'nothing is swapped'
