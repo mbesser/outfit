@@ -9,7 +9,6 @@ and nothing loaded from another host. It is a retro Mac desktop on purpose. Its 
 | `site/index.html` | the page. Title, description, Open Graph and JSON-LD (the app and the FAQ) are in its head |
 | `site/style.css` | all of the styling |
 | `site/site.js` | the Copy button. Without JavaScript the button simply is not shown |
-| `site/hero.svg` | the hero illustration: an agent trying on outfits, animated in CSS inside the SVG, so the CSP holds. Generated: edit `scripts/site-hero.py` and run `python3 scripts/site-hero.py`, never the SVG itself. With reduced motion it is one still frame |
 | `site/404.html` | "Sorry, a system error occurred." |
 | `site/og.png` | the 1200x630 card social networks show. Re-take it when the headline changes |
 | `site/llms.txt` | the same story for coding agents (`llms.txt` convention), with links to the docs |
@@ -26,8 +25,7 @@ when you save). Any browser works too: `open site/index.html`.
 one h1, a title of at most 60 characters, a description of at most 160, an absolute canonical that is the
 one in the sitemap and robots.txt, JSON-LD that parses and whose FAQ is exactly the questions on the page,
 every local link existing, nothing inline or remote (the page's content-security policy forbids it), a
-1200x630 `og.png`, a `hero.svg` that is exactly what `scripts/site-hero.py` draws, and the install line
-identical in the README, `docs/install.md`, the page and `llms.txt`.
+1200x630 `og.png`, and the install line identical in the README, `docs/install.md`, the page and `llms.txt`.
 
 ## Going live
 

@@ -13,7 +13,6 @@ Run from the repository root: python3 tests/validate-site.py
     site/llms.txt (AGENTS.md, Voice: one message)
 """
 import html
-import importlib.util
 import json
 import os
 import re
@@ -103,17 +102,6 @@ check_page("404.html", read("site", "404.html"))
 css = read("site", "style.css")
 if re.search(r"@import|url\(\s*['\"]?(https?:)?//", css):
     fail("style.css imports or loads something from another host")
-
-# hero.svg is generated; the file must be exactly what the generator draws, and load nothing itself.
-sys.dont_write_bytecode = True  # no __pycache__ left in scripts/
-spec = importlib.util.spec_from_file_location("site_hero", os.path.join(ROOT, "scripts", "site-hero.py"))
-hero = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(hero)
-svg = read("site", "hero.svg")
-if svg != hero.build():
-    fail("site/hero.svg is not what scripts/site-hero.py draws: edit the script and run it, not the SVG")
-if re.search(r"<script|\son[a-z]+=|href=|url\(\s*['\"]?(https?:)?//|@import", svg):
-    fail("hero.svg runs or loads something; it must be self-contained pixels and CSS")
 
 with open(os.path.join(SITE, "og.png"), "rb") as f:
     head = f.read(24)
